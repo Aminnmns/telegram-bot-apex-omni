@@ -1,8 +1,8 @@
 """
 Read-only dashboard voor de signal-bot. Leest alleen uit bot_history.db
 (geschreven door main.py/executor.py via db.py) en doet live, read-only
-info-calls naar Hyperliquid (open posities, PnL) -- doet zelf nooit iets op
-Telegram of Hyperliquid, plaatst of wijzigt geen orders.
+info-calls naar ApeX Omni (open posities, PnL) -- doet zelf nooit iets op
+Telegram of ApeX Omni, plaatst of wijzigt geen orders.
 
 Draait BEWUST alleen op met naam genoemde interfaces (127.0.0.1 voor de
 bestaande SSH-tunnel-route, plus het Tailscale-IP voor toegang via het
@@ -11,6 +11,22 @@ openzetten. Geen auth, toont trade-details, dus dit mag nooit publiek
 bereikbaar zijn.
 
     python dashboard.py
+
+OVERSTAP VAN HYPERLIQUID NAAR APEX OMNI (2026): dit bestand deed voorheen
+synchrone info-calls naar Hyperliquid's `Info`-object. De nieuwe
+`apexomni`-SDK werkt via executor.py's async client (zie executor._get_client()),
+dus elke functie hieronder haalt data op via _run() -- een simpele
+`asyncio.run()`-wrapper per Flask-request. Voor een read-only dashboard met
+een handvol requests per pagina-load (geen concurrency-druk) is dat de
+eenvoudigste correcte brug, geen aparte event-loop-thread nodig.
+
+LET OP -- veldenschema-onzekerheid (zie executor.py's moduledocstring voor de
+volledige uitleg wat wél/niet tegen ApeX Omni's testnet geverifieerd is):
+positie-velden (liq-prijs, leverage) en vooral get_realized_trades()'s
+fill-groepering zijn NIET rechtstreeks bevestigd tegen echte trade-historie
+(het testaccount had geen gevulde trades). Waar dat spéélt, staat een
+expliciete comment; bij een verkeerde aanname faalt de betreffende kaart
+zacht (rode "fout bij ophalen"-pill), niet de hele pagina.
 """
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -18,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template_string, request
 
 import db
-from executor import _get_info, get_owner_address
+import executor
 
 app = Flask(__name__)
 
@@ -31,24 +47,46 @@ PORT = 8787
 LADDER_STRATEGY_START = "2026-08-17"
 
 
+def _run(coro):
+    """Bridge van Flask's synchrone request-handling naar executor.py's async
+    ApeX Omni-client. Eén nieuwe event-loop per call -- prima voor een
+    read-only dashboard met lage requestfrequentie (auto-refresh elke 12s)."""
+    import asyncio
+    return asyncio.run(coro)
+
+
 def get_open_positions_and_pnl() -> dict:
     """Open live posities + ongerealiseerd resultaat, rechtstreeks uit
-    Hyperliquid's clearinghouseState (niet de lokale db, die kent geen
-    closes/fills)."""
+    ApeX Omni's account-endpoint (niet de lokale db, die kent geen
+    closes/fills).
+
+    Velden `entry_px`/`unrealized_pnl` volgen dezelfde camelCase-conventie
+    die al bevestigd is op accountniveau (get_account_balance_v3's
+    "unrealizedPnl", zie executor.py) -- `entryPrice`/`unrealizedPnl` per
+    positie is daarmee een goed onderbouwde aanname. `liq_px`/`leverage`
+    per positie zijn wel ongeverifieerd (geen bevestigd veld gevonden in de
+    SDK-broncode of live tests) -- ontbreken ze, toont de tabel gewoon '-'."""
     result = {"positions": [], "unrealized_total": 0.0, "error": None}
     try:
-        owner = get_owner_address()
-        state = _get_info().user_state(owner)
-        for ap in state.get("assetPositions", []):
-            p = ap["position"]
-            pnl = float(p["unrealizedPnl"])
+        client = _run(executor._get_client())
+        resp = _run(executor._call(client.get_account_v3))
+        data = executor._check_order_status(resp, "posities opvragen")
+        for p in (data.get("positions") or []):
+            size = float(p.get("size", 0) or 0)
+            if size == 0:
+                continue
+            symbol = str(p.get("symbol", ""))
+            coin = symbol.split("-")[0] if "-" in symbol else symbol
+            side_field = str(p.get("side", "")).upper()
+            is_long = (side_field == "BUY") if side_field else size > 0
+            pnl = float(p.get("unrealizedPnl", 0) or 0)
             result["positions"].append({
-                "coin": p["coin"],
-                "side": "Long" if float(p["szi"]) > 0 else "Short",
-                "size": abs(float(p["szi"])),
-                "entry_px": float(p["entryPx"]) if p.get("entryPx") else None,
-                "liq_px": float(p["liquidationPx"]) if p.get("liquidationPx") else None,
-                "leverage": p.get("leverage", {}).get("value"),
+                "coin": coin,
+                "side": "Long" if is_long else "Short",
+                "size": abs(size),
+                "entry_px": float(p["entryPrice"]) if p.get("entryPrice") else None,
+                "liq_px": float(p["liquidatePrice"]) if p.get("liquidatePrice") else None,
+                "leverage": p.get("leverage"),
                 "unrealized_pnl": pnl,
             })
             result["unrealized_total"] += pnl
@@ -66,28 +104,52 @@ def get_pnl_cutoff() -> dict:
     gebruik": het laatste moment dat de account-waarde (bijna) nul was, vlak
     vóór de recentste storting(en).
 
-    Nodig gebleken (2026-08-10, zelf ontdekt via een gebruikersvraag over een
-    inconsistentie): dit account heeft oudere, allang afgewikkelde
-    trading-historie van vóór de huidige stortingen ($5.81 + $23.66). Zonder
-    filter telde "laatste 20 closes" grotendeels fills van 17 juni-8 juli mee
-    -- weken oud, en al lang niet meer terug te vinden in het huidige saldo
-    (het account stond vlak voor de storting op $0.0013). Nagerekend:
-    saldo nu ($29.37) = stortingen ($29.47) - fees/PnL van ALLEEN de fills ná
-    dit cutoff-moment. Dat klopte, dus dit is de juiste afbakening.
+    Nodig gebleken (2026-08-10, oorspronkelijk op Hyperliquid, zelf ontdekt
+    via een gebruikersvraag over een inconsistentie): dit account had oudere,
+    allang afgewikkelde trading-historie van vóór de toenmalige stortingen.
+    Zonder filter telde "laatste 20 closes" grotendeels weken oude fills mee,
+    al lang niet meer terug te vinden in het huidige saldo.
 
-    Gebruikt Hyperliquid's portfolio()-endpoint (accountValueHistory, "day"-
-    bucket = fijnste resolutie) i.p.v. een hardcoded datum, zodat dit blijft
-    kloppen als het account ooit weer drooggelegd en opnieuw gefund wordt.
-    """
+    Gebruikt ApeX Omni's history_value_v3()-endpoint (historische
+    accountwaarde) i.p.v. een hardcoded datum, zodat dit blijft kloppen als
+    het account ooit weer drooggelegd en opnieuw gefund wordt.
+
+    LET OP: history_value_v3()'s exacte responsvorm is NIET bevestigd tegen
+    live data (geen accountwaarde-historie op het testaccount om tegen te
+    checken) -- vandaar de brede, tolerante parsing hieronder die een paar
+    plausibele vormen probeert en anders zacht faalt met een duidelijke
+    foutmelding i.p.v. te crashen. De rest van het dashboard blijft gewoon
+    werken als dit faalt (zie index()'s "sinds storting"-preset, niet de
+    default weergave)."""
     try:
-        owner = get_owner_address()
-        portfolio = _get_info().portfolio(owner)
-        day_bucket = next((bucket for label, bucket in portfolio if label == "day"), None)
-        history = day_bucket.get("accountValueHistory", []) if day_bucket else []
+        client = _run(executor._get_client())
+        resp = _run(executor._call(client.history_value_v3))
+        data = executor._check_order_status(resp, "accountwaarde-historie opvragen")
+
+        # Probeer een paar plausibele vormen: een platte lijst van
+        # {"time"/"createdAt": ..., "value"/"totalEquityValue": ...}-dicts,
+        # eventueel genest onder een sleutel als "historyValue"/"list"/"data".
+        entries = None
+        if isinstance(data, list):
+            entries = data
+        elif isinstance(data, dict):
+            for key in ("historyValue", "list", "items", "data"):
+                if isinstance(data.get(key), list):
+                    entries = data[key]
+                    break
+        if entries is None:
+            return {"cutoff_ms": None, "error": "onbekende responsvorm van history_value_v3 (niet geverifieerd)"}
+
         cutoff_ms = None
-        for ts, value in history:
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("time") or entry.get("createdAt") or entry.get("timestamp")
+            value = entry.get("value") or entry.get("totalEquityValue") or entry.get("equity")
+            if ts is None or value is None:
+                continue
             if float(value) < PNL_NEAR_ZERO_USD:
-                cutoff_ms = ts
+                cutoff_ms = int(ts)
         return {"cutoff_ms": cutoff_ms, "error": None}
     except Exception as e:
         return {"cutoff_ms": None, "error": str(e)}
@@ -119,56 +181,71 @@ TRADE_LEG_GROUP_WINDOW_MS = 3000  # zie get_realized_trades()
 
 def get_realized_trades(cutoff_ms, end_ms=None, limit: int = 60) -> dict:
     """
-    Groepeert Hyperliquid's losse fills (user_fills()) tot herkenbare
-    'trades': 1 of meer 'Open <coin>'-fills (de entry, evt. in meerdere
-    prijs-fills), gevolgd door de losse cash-out-momenten (TP-groepsbericht,
-    break-even-SL, cancel) tot de positie weer plat is. Close-fills die
-    binnen TRADE_LEG_GROUP_WINDOW_MS van elkaar vallen worden als 1 "leg"
-    samengevoegd -- 1 TP-groepsbericht kan in meerdere prijs-fills uiteenvallen
-    (zie de PENGU/HYPE-fills die zelf onderzocht zijn: meerdere fills binnen
-    dezelfde seconde per TP-event).
+    Groepeert ApeX Omni's losse fills (fills_v3()) tot herkenbare 'trades':
+    1 of meer openings-fills (de entry, evt. in meerdere prijs-fills),
+    gevolgd door de losse cash-out-momenten (TP-groepsbericht, break-even-SL,
+    cancel) tot de positie weer plat is. Close-fills die binnen
+    TRADE_LEG_GROUP_WINDOW_MS van elkaar vallen worden als 1 "leg"
+    samengevoegd -- zelfde groeperingslogica als voorheen op Hyperliquid.
+
+    GROOTSTE ONGEVERIFIEERDE AANNAME IN DEZE PORT: Hyperliquid's fills hadden
+    een tekstueel `dir`-veld ("Open Long"/"Close Short") om open- van
+    close-fills te onderscheiden. ApeX Omni's fills_v3() bleek in tests een
+    lege lijst te geven (geen trade-historie op het testaccount) -- het
+    exacte veldenschema per fill is dus niet bevestigd. In plaats van een
+    fantasie-`dir`-veld te verzinnen, wordt hier het WEL bevestigde
+    `reduceOnly`-veld gebruikt (bevestigd op order-niveau via live
+    testnet-tests, zie executor.py) als open/close-signaal:
+    reduceOnly=False = openende fill, reduceOnly=True = closende fill. Dat is
+    semantisch correct voor deze bot (elke entry is reduceOnly=False, elke
+    exit reduceOnly=True), maar de aanname dat fills_v3() dit veld per fill
+    doorgeeft is niet bevestigd. Faalt deze aanname, dan faalt deze functie
+    zacht (rode "fout bij ophalen"-pill) -- verifieer tegen echte
+    trade-historie zodra die er is.
 
     De trade-STRUCTUUR (welke fill bij welke trade hoort, en de entry-prijs)
-    wordt op de VOLLEDIGE historie opgebouwd, ongeacht cutoff_ms/end_ms --
-    anders klopt de entry-prijs niet meer voor een trade die vóór de gekozen
-    periode begon maar er middenin een TP raakte. cutoff_ms/end_ms filteren
-    alleen welke LEGS getoond en opgeteld worden; een trade zonder legs in de
-    gekozen periode wordt overgeslagen (dit is bewust een "winsten"-overzicht,
-    geen trade-log -- een net geopende trade zonder cash-out hoort hier niet
-    in thuis, zie tab Open posities daarvoor).
+    wordt op de VOLLEDIGE historie opgebouwd, ongeacht cutoff_ms/end_ms.
+    cutoff_ms/end_ms filteren alleen welke LEGS getoond en opgeteld worden.
 
-    Fee-conventie: alleen fees van CLOSE-fills tellen mee (net als de vorige,
-    niet-gegroepeerde versie van dit dashboard) -- entry-fees niet, zodat het
-    "netto verdiend"-totaal bovenaan niet stilzwijgend verandert t.o.v. eerder.
+    Fee-conventie: alleen fees van CLOSE-fills tellen mee (net als voorheen).
     """
     result = {"trades": [], "realized_total": 0.0, "fees_total": 0.0, "leg_count": 0, "error": None}
     try:
-        owner = get_owner_address()
-        fills = sorted(_get_info().user_fills(owner), key=lambda f: f["time"])
+        client = _run(executor._get_client())
+        # limit=500 wordt door ApeX Omni afgewezen ("invalid get page size") --
+        # zelf empirisch bepaald dat 100 wél werkt (zelf geverifieerd tegen testnet).
+        resp = _run(executor._call(client.fills_v3, limit=100))
+        data = executor._check_order_status(resp, "fills opvragen")
+        raw_fills = data.get("orders") or []
+        fills = sorted(raw_fills, key=lambda f: int(f.get("createdAt", 0) or 0))
 
         open_trades = {}   # coin -> trade-in-opbouw
         all_trades = []    # chronologische volgorde van start
 
         for f in fills:
-            coin = f.get("coin")
-            direction = f.get("dir", "") or ""
-            sz = float(f["sz"])
-            px = float(f["px"])
-            pnl = float(f.get("closedPnl", 0) or 0)
+            symbol = str(f.get("symbol", ""))
+            coin = symbol.split("-")[0] if "-" in symbol else symbol
+            side = str(f.get("side", "")).upper()
+            reduce_only = bool(f.get("reduceOnly", False))
+            sz = float(f.get("size", 0) or 0)
+            px = float(f.get("price", 0) or 0)
+            pnl = float(f.get("realizedPnl") or f.get("pnl") or 0)
             fee = float(f.get("fee", 0) or 0)
-            ts = f["time"]
+            ts = int(f.get("createdAt", 0) or 0)
+            if not coin or sz == 0:
+                continue
 
-            if direction.startswith("Open"):
-                side = "Long" if "Long" in direction else "Short"
+            if not reduce_only:
+                trade_side = "Long" if side == "BUY" else "Short"
                 t = open_trades.get(coin)
-                if t is None or t["side"] != side:
-                    t = {"coin": coin, "side": side, "entry_qty": 0.0,
+                if t is None or t["side"] != trade_side:
+                    t = {"coin": coin, "side": trade_side, "entry_qty": 0.0,
                          "entry_notional": 0.0, "entry_time": ts, "legs": [], "closed_qty": 0.0}
                     open_trades[coin] = t
                     all_trades.append(t)
                 t["entry_qty"] += sz
                 t["entry_notional"] += sz * px
-            elif direction.startswith("Close") and coin in open_trades:
+            elif reduce_only and coin in open_trades:
                 t = open_trades[coin]
                 if t["legs"] and (ts - t["legs"][-1]["time"]) <= TRADE_LEG_GROUP_WINDOW_MS:
                     leg = t["legs"][-1]
@@ -575,7 +652,7 @@ PAGE = """
         </div>
       </div>
       <div class="trade-meta">
-        entry {{ "%.6g"|format(t.entry_px) }} &middot; {{ t.entry_time }} UTC
+        entry {{ "%.6g"|format(t.entry_px) if t.entry_px else '-' }} &middot; {{ t.entry_time }} UTC
         {% if t.still_open %}&middot; <span class="pill pill-blue">nog {{ "%.6g"|format(t.remaining_qty) }} open</span>{% endif %}
       </div>
       <div class="trade-legs">
@@ -665,14 +742,15 @@ def index():
     # Welke preset is actief? Bepaalt zowel welke knop oplicht als welke
     # cutoff-logica gebruikt wordt. Standaard (geen query-params) = sinds
     # ladder-strategie, NIET "sinds storting": die laatste leunt op
-    # get_pnl_cutoff()'s account-bijna-leeg-detectie, en Hyperliquid's
-    # portfolio()-endpoint bewaart die geschiedenis niet lang genoeg -- na
-    # verloop van tijd valt het stortingsmoment buiten bereik en levert
-    # get_pnl_cutoff() cutoff_ms=None terug, waarna hier stilzwijgend ALLE
-    # historie (incl. weken oude, allang afgewikkelde trades) meetelde. Voor
-    # een cijfer dat "hoeveel heb ik verdiend" moet beantwoorden is dat
-    # ronduit misleidend, dus "sinds storting" is nu een expliciete keuze
-    # (?range=deposit) i.p.v. de default.
+    # get_pnl_cutoff()'s account-bijna-leeg-detectie via history_value_v3(),
+    # wat -- net als voorheen bij Hyperliquid's portfolio()-endpoint -- die
+    # geschiedenis mogelijk niet lang genoeg bewaart. Na verloop van tijd valt
+    # het stortingsmoment dan buiten bereik en levert get_pnl_cutoff()
+    # cutoff_ms=None terug, waarna hier stilzwijgend ALLE historie (incl.
+    # weken oude, allang afgewikkelde trades) meetelde. Voor een cijfer dat
+    # "hoeveel heb ik verdiend" moet beantwoorden is dat ronduit misleidend,
+    # dus "sinds storting" is een expliciete keuze (?range=deposit) i.p.v. de
+    # default.
     if range_param == "all":
         active_preset = "all"
     elif range_param == "deposit":
@@ -696,7 +774,7 @@ def index():
         pnl_cutoff["custom"] = False
         if pnl_cutoff["cutoff_ms"] is None and pnl_cutoff["error"] is None:
             pnl_cutoff["error"] = (
-                "kon geen stortingsmoment bepalen (buiten Hyperliquid's bewaarde historie) "
+                "kon geen stortingsmoment bepalen (buiten ApeX Omni's bewaarde historie) "
                 "-- toont nu ALLE historie, incl. mogelijk weken oude, allang afgewikkelde trades"
             )
     else:

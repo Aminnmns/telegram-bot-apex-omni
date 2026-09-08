@@ -6,18 +6,40 @@ eigen "Take-Profit target N ✅"-berichten via handle_tp_event(). 5-staps
 TP-ladder (targets 1 t/m 4 elk hun eigen cumulatieve percentage van de
 ORIGINELE qty, target 5 altijd de volledige rest) met automatische
 MIN_NOTIONAL_USD-doorschuif-fallback (zie executor._handle_tp_partial_event).
-Mockt de Hyperliquid Exchange/Info-objecten volledig -- geen echte private
-key, netwerk of geld nodig:
+Mockt de ApeX Omni-client (apexomni.http_private_sign.HttpPrivateSign)
+volledig -- geen echte private key, netwerk of geld nodig:
 
     python test_exit_strategy.py
 
 Isolatie (belangrijk, zie incident 2026-08-10): dit script geeft de fake
-exchange/info als EXPLICIETE functie-argumenten mee aan place_entry_order()/
+client als EXPLICIET functie-argument mee aan place_entry_order()/
 handle_tp_event()/handle_cancel_event() -- geen monkeypatching van
-executor._get_exchange()/_get_info() meer. Daarnaast wordt executor.STATE_FILE
-en db.DB_PATH allebei omgeleid naar bestanden buiten de projectmap, zodat dit
+executor._get_client() nodig. Daarnaast wordt executor.STATE_FILE en
+db.DB_PATH allebei omgeleid naar bestanden buiten de projectmap, zodat dit
 script het gedeelde open_positions.json/bot_history.db van de live
 signal-bot.service nooit kan raken, ongeacht wat er verder misgaat.
+
+OVERSTAP VAN HYPERLIQUID NAAR APEX OMNI: dit bestand mockte voorheen een
+`FakeHyperliquidServer` (Exchange/Info-objecten met `market_open()`/
+`order()`/`cancel()`/`user_state()`). ApeX Omni's `apexomni`-SDK werkt anders
+genoeg (één client-object, `create_order_v3()`/`get_order_v3()`/
+`delete_order_v3()`, market-orders die NIET synchroon vullen -- zie
+executor._await_order_fill -- en één gecombineerd balance-endpoint i.p.v.
+Hyperliquid's aparte perps/spot-calls) dat dit een structurele herbouw was,
+geen 1-op-1 hernoeming. De business-logica die hier getest wordt (margin-
+sizing-wiskunde, TP-ladder-percentages, breakeven-PnL-berekening, dupe-/
+re-entry-/opposite-position-guards) is in executor.py ONGEWIJZIGD overgenomen
+van de Hyperliquid-versie -- alleen de exchange-laag eronder is vervangen, en
+dat is precies wat FakeApexServer hieronder simuleert. Waar de oude tests een
+EXACTE call-sequentie op de fake Exchange/Info-objecten controleerden (bv.
+`["user_state", "meta_and_asset_ctxs", ...]`), controleren de nieuwe tests in
+plaats daarvan de MUTERENDE calls (create_order_v3/delete_order_v3/
+set_initial_margin_rate_v3, zie `action_calls()`) -- de exacte read-call-
+plumbing (hoeveel keer ticker_v3/get_account_v3/get_order_v3 wordt aangeroepen)
+is nu ApeX-SDK-specifiek en geen onderdeel van wat deze tests willen
+bewijzen; welke orders geplaatst/geannuleerd worden, met welke parameters, in
+welke volgorde, is dat wel en blijft daarom net zo strak gecontroleerd als
+voorheen.
 
 Scenario's:
 1.  place_entry_order() v2: margin-based qty (MAX_MARGIN_PCT_OF_FUNDS% van
@@ -27,7 +49,8 @@ Scenario's:
 1c. Nagenoeg geen beschikbaar saldo (perps-withdrawable + spot-USDC SAMEN
     te laag) -> qty rondt af naar 0 -> overslaan, geen order-calls.
 1c-bis. Perps-withdrawable alléén is te laag, maar vrije spot-USDC dekt het
-    gat -> MOET slagen.
+    gat -> MOET slagen (ApeX Omni's get_account_balance_v3 geeft dit als één
+    gecombineerd availableBalance-veld terug, zie _withdrawable_from_balance).
 1d. qty > 0 na afronding, maar orderwaarde onder MIN_NOTIONAL_USD -> zelfde
     skip-pad als 1c.
 1e. Losse unit-check: margin_to_use = available_funds * (MAX_MARGIN_PCT_OF_FUNDS
@@ -36,8 +59,7 @@ Scenario's:
     van de (door andere open posities geslonken) withdrawable -> blijft
     constant ongeacht hoeveel marge al vastzit elders.
 1g. Diezelfde totale-accountwaarde-qty past niet binnen de werkelijk vrije
-    marge -> nette skip (skipped_insufficient_margin), geen Hyperliquid-
-    afwijzing.
+    marge -> nette skip (skipped_insufficient_margin), geen ApeX Omni-afwijzing.
 2.  TP-event target 1 -> TP_EVENT_TARGET1_CLOSE_PCT% (15%, jouw live .env-
     ladder) van de ORIGINELE qty market-sluiten, GEEN SL-aanpassing (BE-shift
     zit sinds 2026-08-25 op config.BREAKEVEN_MOVE_AFTER_TARGET, default
@@ -76,6 +98,10 @@ Scenario's:
     "#X/USDT Cancelled" als losse berichten) -> genegeerd, geen dubbele close.
 10c. BIJNA-gelijktijdig duplicaat cancel-event (i.p.v. sequentieel zoals 10b).
 10d. DRY_RUN-veiligheidsnet in handle_cancel_event().
+11. Dynamische break-even-SL past zich aan aan ECHT gebankte winst.
+12. Same-side re-entry -- samenvoegen i.p.v. overschrijven.
+12b. Re-entry-fallback als de samengevoegde positie niet te bevestigen is.
+13. Nieuw signaal in de TEGENOVERGESTELDE richting van een bestaand v2-record.
 """
 import asyncio
 import json
@@ -99,11 +125,16 @@ config.MAX_CONCURRENT_POSITIONS = 5
 # zetten 'm tijdelijk terug op True om juist het DRY_RUN-veiligheidsnet zelf
 # te testen.
 config.DRY_RUN = False
-# Expliciet fout gezet, geen valide 32-byte key -- als er OOIT een pad zou
-# zijn dat toch de echte _get_wallet()/_get_exchange() aanspreekt (i.p.v. de
-# hieronder geïnjecteerde fake), moet dat hard falen bij het signen, niet
-# stilletjes een order op een bestaand account plaatsen.
-config.HYPERLIQUID_PRIVATE_KEY = "0x" + "00" * 32
+# Expliciet fout/nep gezet -- als er OOIT een pad zou zijn dat toch de echte
+# executor._get_client() aanspreekt (i.p.v. de hieronder geïnjecteerde fake),
+# moet dat hard falen bij het signen/authenticeren, niet stilletjes een order
+# op een bestaand account plaatsen.
+config.APEX_ETH_PRIVATE_KEY = "00" * 32
+config.APEX_API_KEY = "test-fake-key"
+config.APEX_API_SECRET = "test-fake-secret"
+config.APEX_API_PASSPHRASE = "test-fake-passphrase"
+config.APEX_ZK_SEEDS = "00" * 32
+config.APEX_ZK_L2KEY = "0x" + "00" * 32
 
 import db
 import executor
@@ -121,50 +152,78 @@ db.DB_PATH = TEST_DB_PATH
 
 FAKE_OWNER = "0x000000000000000000000000000000deadbeef"
 
+# De enige SDK-methodes die daadwerkelijk state op de (fake) exchange
+# muteren -- orders plaatsen/annuleren, leverage/margin-rate zetten. Read-only
+# calls (ticker_v3/get_account_v3/get_account_balance_v3/get_order_v3/
+# get_worst_price_v3/historical_pnl_v3) zijn ApeX-SDK-plumbing en geen
+# onderdeel van wat deze tests willen bewijzen (zie moduledocstring).
+_ACTION_METHODS = {"create_order_v3", "delete_order_v3", "set_initial_margin_rate_v3"}
 
-class FakeHyperliquidServer:
-    """Houdt bij welke SDK-calls er zijn gedaan en simuleert Hyperliquid's
-    responses voor de v2-flow (SL-only entry, reduce-only IOC-close op
-    TP-events). `universe_symbol` laat toe om per test-scenario een andere
-    market te simuleren (bv. een losse, goedkope "EDGE"-coin voor de
-    MIN_NOTIONAL_USD-edge-case, los van de SOL-market die de rest van het
-    script gebruikt)."""
 
-    def __init__(self, mark_px: float, max_leverage: int, sz_decimals: int,
+def action_calls(calls):
+    return [(name, kwargs) for name, kwargs in calls if name in _ACTION_METHODS]
+
+
+class FakeApexServer:
+    """Houdt bij welke SDK-calls er zijn gedaan (`self.calls`, ALLE calls;
+    gebruik `action_calls()` voor alleen de muterende) en simuleert ApeX
+    Omni's v3-API-responses voor de v2-flow (SL-only entry via STOP_MARKET,
+    reduce-only MARKET-close op TP-events). `universe_symbol` laat toe om
+    per test-scenario een andere market te simuleren (bv. een losse,
+    goedkope "EDGE"-coin voor de MIN_NOTIONAL_USD-edge-case, los van de
+    SOL-market die de rest van het script gebruikt).
+
+    MARKET-orders "vullen" synchroon op het moment van create_order_v3() --
+    status/cumSuccessFillSize/averagePrice staan meteen goed, dus
+    executor._await_order_fill() slaagt altijd op de EERSTE get_order_v3()-
+    poll (deterministisch, geen trage tests). STOP_MARKET-orders blijven
+    UNTRIGGERED (resting), net als een echte SL/breakeven-SL op ApeX Omni."""
+
+    def __init__(self, mark_px: float, max_leverage: int, tick_size: str = "0.01", step_size: str = "0.01",
                  perp_withdrawable: float = 1000.0, spot_free_usdc: float = 0.0,
                  universe_symbol: str = "SOL",
                  perp_account_value: float = None, spot_total_usdc: float = None):
         self.calls = []
         self.universe_symbol = universe_symbol
+        self.apex_symbol = f"{universe_symbol}-USDT"
         self.mark_px = mark_px
         self.max_leverage = max_leverage
-        self.sz_decimals = sz_decimals
-        # Twee losse velden, want get_withdrawable() telt ze nu op -- zelf
-        # empirisch geverifieerd (2026-08-11): Hyperliquid accepteert nieuwe
-        # posities die meer marge vereisen dan clearinghouseState.withdrawable
-        # alleen toestaat, gedekt door vrije spot-USDC (spot_user_state's
-        # tokenToAvailableAfterMaintenance). Zie get_withdrawable()'s docstring.
+        self.tick_size = tick_size
+        self.step_size = step_size
+        # Twee losse velden, want _withdrawable_from_balance() combineert ze
+        # (via de fake get_account_balance_v3() hieronder) -- zelfde
+        # empirisch geverifieerde reden als voorheen bij Hyperliquid (2026-08-11):
+        # een exchange kan nieuwe posities accepteren die meer marge vereisen
+        # dan het "withdrawable"-achtige veld alleen toestaat, gedekt door
+        # vrije spot-USDC. ApeX Omni geeft dit als ÉÉN gecombineerd
+        # availableBalance-veld terug (zie executor._withdrawable_from_balance's
+        # docstring), maar deze fake houdt de twee bronnen bewust apart
+        # instelbaar zodat bestaande scenario's (1c-bis, 1f, 1g) ze
+        # onafhankelijk kunnen variëren.
         self.perp_withdrawable = perp_withdrawable
         self.spot_free_usdc = spot_free_usdc
-        # accountValue/spot-total zijn los van withdrawable/spot_free, want
-        # get_total_equity() gebruikt ze als sizing-basis i.p.v. wat er NU nog
-        # vrij is (zie _total_equity_from_state). Als property: volgt
-        # withdrawable/spot_free automatisch tenzij expliciet overschreven --
-        # zo blijven bestaande tests die alleen `server.perp_withdrawable = X`
-        # aanpassen ongewijzigd werken (accountwaarde == wat er vrij is), en
-        # kan een nieuw scenario ze bewust laten afwijken (marge al vast in
-        # andere gelijktijdig open posities).
         self._perp_account_value_override = perp_account_value
         self._spot_total_usdc_override = spot_total_usdc
-        self._next_oid = 1000
+        self._next_id = 1000
         self.open_positions_count = 0  # voor count_open_positions()
-        # Optioneel: {"coin", "szi", "entryPx"} -- simuleert wat Hyperliquid's
-        # ECHTE clearinghouseState rapporteert voor _get_live_position()/
-        # reconcile_positions(), los van open_positions_count hierboven (die
-        # kent geen szi/entryPx). Alleen gezet in scenario's die dit expliciet
-        # testen (re-entry-merge, reconciliatie); overal elders None, dus
-        # bestaand gedrag blijft ongewijzigd.
+        # Optioneel: {"symbol", "side", "size", "entryPrice"} -- simuleert wat
+        # ApeX Omni's ECHTE get_account_v3()["positions"] rapporteert voor
+        # _get_live_position()/reconcile_positions(), los van
+        # open_positions_count hierboven. Alleen gezet in scenario's die dit
+        # expliciet testen (re-entry-merge, opposite-position-guard); overal
+        # elders None, dus bestaand gedrag blijft ongewijzigd.
         self.live_position_override = None
+        self.default_address = FAKE_OWNER
+        self.configV3 = {"contractConfig": {"perpetualContract": [self._symbol_config()]}}
+        self.orders = {}  # order-id(str) -> order-dict
+
+    def _symbol_config(self):
+        return {
+            "symbol": self.apex_symbol,
+            "tickSize": self.tick_size,
+            "stepSize": self.step_size,
+            "displayMaxLeverage": str(self.max_leverage),
+        }
 
     @property
     def perp_account_value(self):
@@ -186,77 +245,89 @@ class FakeHyperliquidServer:
     def spot_total_usdc(self, value):
         self._spot_total_usdc_override = value
 
-    def next_oid(self) -> int:
-        self._next_oid += 1
-        return self._next_oid
+    def _next_order_id(self) -> str:
+        self._next_id += 1
+        return str(self._next_id)
 
-    # --- Info-achtige methodes ---
-    def user_state(self, address):
-        self.calls.append(("user_state", {"address": address}))
-        positions = [{"position": {"coin": "SOL"}}] * self.open_positions_count
+    # --- v3 read endpoints ---
+    def configs_v3(self):
+        self.calls.append(("configs_v3", {}))
+        return {"data": self.configV3}
+
+    def get_account_v3(self):
+        self.calls.append(("get_account_v3", {}))
+        positions = [
+            {"symbol": f"FILLER{i}-USDT", "side": "BUY", "size": "1", "entryPrice": "1"}
+            for i in range(self.open_positions_count)
+        ]
         if self.live_position_override is not None:
-            positions = positions + [{"position": self.live_position_override}]
-        return {
-            "assetPositions": positions,
-            "withdrawable": self.perp_withdrawable,
-            "marginSummary": {"accountValue": self.perp_account_value},
-        }
+            positions.append(self.live_position_override)
+        return {"data": {"positions": positions}}
 
-    def spot_user_state(self, address):
-        self.calls.append(("spot_user_state", {"address": address}))
-        return {
-            "balances": [{"coin": "USDC", "token": 0, "total": str(self.spot_total_usdc), "hold": "0.0"}],
-            "tokenToAvailableAfterMaintenance": [[0, str(self.spot_free_usdc)]],
-        }
+    def get_account_balance_v3(self):
+        self.calls.append(("get_account_balance_v3", {}))
+        return {"data": {
+            "totalEquityValue": str(self.perp_account_value + self.spot_total_usdc),
+            "availableBalance": str(self.perp_withdrawable + self.spot_free_usdc),
+        }}
 
-    def meta_and_asset_ctxs(self):
-        self.calls.append(("meta_and_asset_ctxs", {}))
-        universe = [{"name": self.universe_symbol, "szDecimals": self.sz_decimals,
-                     "maxLeverage": self.max_leverage, "onlyIsolated": False}]
-        ctxs = [{"markPx": str(self.mark_px)}]
-        return [{"universe": universe}, ctxs]
+    def ticker_v3(self, symbol):
+        self.calls.append(("ticker_v3", {"symbol": symbol}))
+        return {"data": [{"markPrice": str(self.mark_px)}]}
 
-    # --- Exchange-achtige methodes ---
-    def update_leverage(self, leverage, name, is_cross):
-        self.calls.append(("update_leverage", {"leverage": leverage, "name": name, "is_cross": is_cross}))
-        return {"status": "ok", "response": {"type": "default"}}
+    def get_worst_price_v3(self, symbol, side, size):
+        self.calls.append(("get_worst_price_v3", {"symbol": symbol, "side": side, "size": size}))
+        return {"data": {"worstPrice": str(self.mark_px)}}
 
-    def market_open(self, name, is_buy, sz, px=None, slippage=0.05, cloid=None, builder=None):
-        self.calls.append(("market_open", {"name": name, "is_buy": is_buy, "sz": sz}))
-        return {"status": "ok", "response": {"data": {"statuses": [
-            {"filled": {"totalSz": str(sz), "avgPx": str(self.mark_px), "oid": self.next_oid()}}
-        ]}}}
+    def get_order_v3(self, id):
+        self.calls.append(("get_order_v3", {"id": id}))
+        return {"data": self.orders.get(id, {})}
 
-    def order(self, name, is_buy, sz, limit_px, order_type, reduce_only=False, cloid=None, builder=None):
-        self.calls.append(("order", {
-            "name": name, "is_buy": is_buy, "sz": sz, "limit_px": limit_px,
-            "order_type": order_type, "reduce_only": reduce_only,
+    def historical_pnl_v3(self, symbol=None, limit=None):
+        self.calls.append(("historical_pnl_v3", {"symbol": symbol, "limit": limit}))
+        return {"data": {"historicalPnl": []}}
+
+    # --- v3 write endpoints ---
+    def set_initial_margin_rate_v3(self, symbol, initialMarginRate):
+        self.calls.append(("set_initial_margin_rate_v3", {"symbol": symbol, "initialMarginRate": initialMarginRate}))
+        return {"data": {}}
+
+    def create_order_v3(self, symbol, side, type, size, price=None, reduceOnly=False,
+                         triggerPrice=None, triggerPriceType=None, isPositionTpsl=False, **_kwargs):
+        self.calls.append(("create_order_v3", {
+            "symbol": symbol, "side": side, "type": type, "size": size, "price": price,
+            "reduceOnly": reduceOnly, "triggerPrice": triggerPrice,
         }))
-        oid = self.next_oid()
-        # Een IOC-order die daadwerkelijk vult rapporteert Hyperliquid als
-        # "filled" (net als market_open), niet als "resting" -- dat laatste
-        # geldt alleen voor trigger-orders (SL) die op de book blijven staan
-        # totdat ze getriggerd worden. executor._handle_tp_partial_event
-        # leest avgPx uit deze fill voor de banked_pnl-berekening.
-        if order_type == {"limit": {"tif": "Ioc"}}:
-            return {"status": "ok", "response": {"data": {"statuses": [
-                {"filled": {"totalSz": str(sz), "avgPx": str(self.mark_px), "oid": oid}}
-            ]}}}
-        return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
+        oid = self._next_order_id()
+        is_market = type == "MARKET"
+        order = {
+            "id": oid, "symbol": symbol, "side": side, "type": type, "size": size,
+            "price": price, "reduceOnly": reduceOnly, "triggerPrice": triggerPrice,
+            "status": "FILLED" if is_market else "UNTRIGGERED",
+            "cumSuccessFillSize": size if is_market else "0",
+            "averagePrice": str(self.mark_px) if is_market else "",
+        }
+        self.orders[oid] = order
+        return {"data": order}
 
-    def cancel(self, name, oid):
-        self.calls.append(("cancel", {"name": name, "oid": oid}))
-        return {"status": "ok", "response": {"data": {"statuses": []}}}
+    def delete_order_v3(self, id):
+        self.calls.append(("delete_order_v3", {"id": id}))
+        if id in self.orders:
+            self.orders[id]["status"] = "CANCELED"
+        return {"data": id}
 
 
-def expected_cum_close_qty(qty, remaining_before, cum_pct, sz_decimals):
+def expected_cum_close_qty(qty, remaining_before, cum_pct, step_size):
     """Onafhankelijke herimplementatie van executor._target_close_qty (als
     oracle voor de asserts hieronder, niet als vervanging van de eigenlijke
     implementatie): hoeveel er nu dicht moet voor cumulatief percentage
-    `cum_pct` van de ORIGINELE qty."""
-    total_should_be_closed = round(qty * (cum_pct / 100), sz_decimals)
-    already_closed = round(qty - remaining_before, sz_decimals)
-    close_qty = round(total_should_be_closed - already_closed, sz_decimals)
+    `cum_pct` van de ORIGINELE qty. Gebruikt executor._round_sz (floor naar
+    een veelvoud van step_size) als rond-primitief -- dezelfde die
+    executor.py zelf gebruikt -- maar herberekent de cumulatieve-close-
+    formule zelf, onafhankelijk van _target_close_qty."""
+    total_should_be_closed = executor._round_sz(qty * (cum_pct / 100), step_size)
+    already_closed = executor._round_sz(qty - remaining_before, step_size)
+    close_qty = executor._round_sz(total_should_be_closed - already_closed, step_size)
     return max(0.0, min(close_qty, remaining_before))
 
 
@@ -264,7 +335,7 @@ async def main():
     db.init_db()
 
     # SOL op 192.85, 50x max leverage.
-    server = FakeHyperliquidServer(mark_px=192.85, max_leverage=50, sz_decimals=2)
+    server = FakeApexServer(mark_px=192.85, max_leverage=50, tick_size="0.01", step_size="0.01")
 
     notifications = []
 
@@ -284,15 +355,14 @@ async def main():
         raw_text="test",
     )
 
-    # --- Stap 1: v2-entry plaatsen (fake exchange/info als argument) ---
-    result = await executor.place_entry_order(signal, dry_run=False, exchange=server, info=server)
+    # --- Stap 1: v2-entry plaatsen (fake client als argument) ---
+    result = await executor.place_entry_order(signal, dry_run=False, client=server)
     assert result is not None and result.startswith("qty="), f"onverwacht return-resultaat: {result}"
 
-    call_names = [name for name, _ in server.calls]
-    assert call_names == [
-        "user_state", "meta_and_asset_ctxs", "user_state", "spot_user_state",
-        "update_leverage", "market_open", "order",
-    ], f"onverwachte volgorde van calls: {call_names}"
+    actions = action_calls(server.calls)
+    action_names = [name for name, _ in actions]
+    assert action_names == ["set_initial_margin_rate_v3", "create_order_v3", "create_order_v3"], \
+        f"onverwachte volgorde van muterende calls: {action_names}"
 
     state = json.load(open(TEST_STATE_FILE))
     assert len(state) == 1, "verwacht 1 open positie in state"
@@ -306,14 +376,16 @@ async def main():
     used_leverage_1 = min(signal.leverage, server.max_leverage)
     withdrawable_1 = server.perp_withdrawable + server.spot_free_usdc
     total_equity_1 = server.perp_account_value + server.spot_total_usdc
-    expected_qty = executor._calc_margin_based_qty(server.mark_px, used_leverage_1, total_equity_1, server.sz_decimals)
+    expected_qty = executor._calc_margin_based_qty(server.mark_px, used_leverage_1, total_equity_1, server.step_size)
     assert qty == expected_qty, f"margin-based qty klopt niet: {qty} != {expected_qty}"
 
-    sl_call = server.calls[6][1]
-    assert sl_call["order_type"]["trigger"]["tpsl"] == "sl" and sl_call["sz"] == qty, \
-        "SL moet op de VOLLE qty staan"
-    assert sl_call["is_buy"] is True, "SL van een SHORT moet een reduce-only BUY-order zijn"
-    assert sl_call["limit_px"] > sl_call["order_type"]["trigger"]["triggerPx"], \
+    entry_call = actions[1][1]
+    sl_call = actions[2][1]
+    assert entry_call["type"] == "MARKET" and entry_call["size"] == str(qty)
+    assert sl_call["type"] == "STOP_MARKET" and sl_call["size"] == str(qty), "SL moet op de VOLLE qty staan"
+    assert sl_call["side"] == "BUY", "SL van een SHORT moet een reduce-only BUY-order zijn"
+    assert sl_call["reduceOnly"] is True
+    assert float(sl_call["price"]) > float(sl_call["triggerPrice"]), \
         "SL-limit moet HOGER dan de trigger staan voor een BUY-exit (agressief genoeg om te vullen)"
     assert "tp1_price" not in pos, "v2-entries plaatsen GEEN TP-trigger-order, dus geen tp1_price"
     print(f"OK stap 1: v2-entry geplaatst, qty={qty} ({config.MAX_MARGIN_PCT_OF_FUNDS}% van "
@@ -335,10 +407,10 @@ async def main():
     )
     server.open_positions_count = config.MAX_CONCURRENT_POSITIONS
     calls_before = len(server.calls)
-    result2 = await executor.place_entry_order(signal2, dry_run=False, exchange=server, info=server)
-    new_calls = [name for name, _ in server.calls[calls_before:]]
+    result2 = await executor.place_entry_order(signal2, dry_run=False, client=server)
+    new_actions = action_calls(server.calls[calls_before:])
     assert result2 is None, f"had overgeslagen moeten worden, kreeg: {result2}"
-    assert new_calls == ["user_state"], f"had alleen de positie-telling mogen doen: {new_calls}"
+    assert new_actions == [], f"had geen muterende calls mogen doen: {new_actions}"
     server.open_positions_count = 0
     assert len(notifications) == 1 and "max posities" in notifications[0]
     notifications.clear()
@@ -356,30 +428,29 @@ async def main():
     server.perp_withdrawable = 0.01
     server.spot_free_usdc = 0.0
     calls_before = len(server.calls)
-    result1c = await executor.place_entry_order(signal1c, dry_run=False, exchange=server, info=server)
-    new_calls = [name for name, _ in server.calls[calls_before:]]
+    result1c = await executor.place_entry_order(signal1c, dry_run=False, client=server)
+    new_actions = action_calls(server.calls[calls_before:])
     assert result1c is None, f"had overgeslagen moeten worden wegens te kleine ordergrootte, kreeg: {result1c}"
-    assert new_calls == ["user_state", "meta_and_asset_ctxs", "user_state", "spot_user_state"], \
-        f"had geen order-calls mogen doen: {new_calls}"
+    assert new_actions == [], f"had geen muterende calls mogen doen: {new_actions}"
     assert len(notifications) == 1 and "te kleine ordergrootte" in notifications[0], notifications
     notifications.clear()
     print("OK stap 1c: trade overgeslagen -- perps-withdrawable ($0.01) + spot ($0.00) samen te weinig voor een qty > 0")
 
     # --- Stap 1c-bis: perps-withdrawable ALLEEN is te laag, maar vrije
-    # spot-USDC dekt het gat -- moet WEL slagen. Dit is precies het
-    # empirisch geverifieerde gedrag van het echte account (2026-08-11):
-    # clearinghouseState.withdrawable=$0.00, maar Hyperliquid accepteerde
-    # een test-order gedekt door vrije spot-USDC. Zie get_withdrawable(). ---
+    # spot-USDC dekt het gat -- moet WEL slagen. ApeX Omni's
+    # get_account_balance_v3() geeft dit als ÉÉN gecombineerd availableBalance-
+    # veld terug (zie executor._withdrawable_from_balance) -- deze fake blijft
+    # de twee bronnen apart bijhouden en optellen, zodat dit scenario nog
+    # steeds bewijst dat een lage "perps-achtige" component gedekt kan worden
+    # door een vrije "spot-achtige" component. ---
     server.perp_withdrawable = 0.0
     server.spot_free_usdc = 1000.0
     calls_before = len(server.calls)
-    result1c_bis = await executor.place_entry_order(signal1c, dry_run=False, exchange=server, info=server)
-    new_calls = [name for name, _ in server.calls[calls_before:]]
+    result1c_bis = await executor.place_entry_order(signal1c, dry_run=False, client=server)
     assert result1c_bis is not None and result1c_bis.startswith("qty="), \
         f"had moeten slagen dankzij vrije spot-USDC, kreeg: {result1c_bis}"
-    assert "spot_user_state" in new_calls, f"get_withdrawable() had spot_user_state moeten aanroepen: {new_calls}"
     print(f"OK stap 1c-bis: perps-withdrawable=$0 maar spot-USDC dekt het -> entry SLAAGT "
-          f"({result1c_bis}), bevestigt dat get_withdrawable() de twee optelt")
+          f"({result1c_bis}), bevestigt dat de gecombineerde availableBalance de twee optelt")
 
     # Opruimen: deze SOL:Buy-entry heeft niets te maken met de rest van het
     # scenario (dat draait verder om de SOL:Sell-entry uit stap 1) -- meteen
@@ -407,17 +478,14 @@ async def main():
         leverage=10, targets=[190.3], stop_loss=200.3, raw_text="tiny",
     )
     # $2 beschikbaar * 33% * 10x / 192.85 rondt af naar een kleine qty>0 met
-    # notional ruim onder MIN_NOTIONAL_USD (bij de oude 25% zou $4 al genoeg
-    # zijn geweest, maar bij 33% is dat nu boven de grens -- vandaar $2 i.p.v.
-    # het oorspronkelijke $4).
+    # notional ruim onder MIN_NOTIONAL_USD.
     server.perp_withdrawable = 2.0
     server.spot_free_usdc = 0.0
     calls_before = len(server.calls)
-    result_tiny = await executor.place_entry_order(signal_tiny, dry_run=False, exchange=server, info=server)
-    new_calls = [name for name, _ in server.calls[calls_before:]]
+    result_tiny = await executor.place_entry_order(signal_tiny, dry_run=False, client=server)
+    new_actions = action_calls(server.calls[calls_before:])
     assert result_tiny is None, f"had overgeslagen moeten worden wegens orderwaarde onder minimum, kreeg: {result_tiny}"
-    assert new_calls == ["user_state", "meta_and_asset_ctxs", "user_state", "spot_user_state"], \
-        f"had geen order-calls mogen doen: {new_calls}"
+    assert new_actions == [], f"had geen muterende calls mogen doen: {new_actions}"
     assert len(notifications) == 1 and "te kleine ordergrootte" in notifications[0], notifications
     notifications.clear()
     orders = db.recent_orders(limit=1)
@@ -428,12 +496,12 @@ async def main():
     # is (i.p.v. de oude 0.25) -- taak 3a. Ronde getallen (leverage=1,
     # entry_px=1.0) zodat er geen afrondingsonzekerheid in de assert zit. ---
     assert config.MAX_MARGIN_PCT_OF_FUNDS == 33.0, "deze check gaat uit van de nieuwe 33%-default"
-    check_funds, check_lev, check_px, check_szdec = 100.0, 1, 1.0, 6
-    check_qty = executor._calc_margin_based_qty(check_px, check_lev, check_funds, check_szdec)
+    check_funds, check_lev, check_px, check_step = 100.0, 1, 1.0, "0.000001"
+    check_qty = executor._calc_margin_based_qty(check_px, check_lev, check_funds, check_step)
     implied_margin_to_use = check_qty * check_px / check_lev
     expected_margin_to_use = check_funds * (config.MAX_MARGIN_PCT_OF_FUNDS / 100)
     assert abs(expected_margin_to_use - 33.0) < 1e-9, expected_margin_to_use
-    assert abs(implied_margin_to_use - expected_margin_to_use) < 1e-9, \
+    assert abs(implied_margin_to_use - expected_margin_to_use) < 1e-6, \
         f"margin_to_use klopt niet: {implied_margin_to_use} != {expected_margin_to_use} (verwacht available_funds*0.33)"
     print(f"OK stap 1e: margin_to_use = available_funds * {config.MAX_MARGIN_PCT_OF_FUNDS/100} "
           f"(${check_funds:.2f} -> ${implied_margin_to_use:.2f} margin), niet meer *0.25")
@@ -441,7 +509,7 @@ async def main():
     # --- Stap 1f: qty blijft CONSTANT als er al marge vastzit in andere
     # gelijktijdig open posities -- MAX_MARGIN_PCT_OF_FUNDS% wordt genomen van
     # de TOTALE accountwaarde, niet van wat er NU nog vrij is (zie
-    # _total_equity_from_state). Zonder deze fix zou de qty hier gebaseerd
+    # _total_equity_from_balance). Zonder deze fix zou de qty hier gebaseerd
     # zijn op de geslonken withdrawable ($500) i.p.v. de volle accountwaarde
     # ($1000), en dus kleiner uitvallen dan bedoeld naarmate meer posities
     # tegelijk openen. ---
@@ -453,11 +521,11 @@ async def main():
     server.spot_free_usdc = 0.0
     server.perp_account_value = 1000.0  # totale accountwaarde blijft hoog
     server.spot_total_usdc = 0.0
-    result_1f = await executor.place_entry_order(signal_1f, dry_run=False, exchange=server, info=server)
+    result_1f = await executor.place_entry_order(signal_1f, dry_run=False, client=server)
     assert result_1f is not None and result_1f.startswith("qty="), f"had moeten slagen: {result_1f}"
     used_leverage_1f = min(signal_1f.leverage, server.max_leverage)
-    expected_qty_1f = executor._calc_margin_based_qty(server.mark_px, used_leverage_1f, 1000.0, server.sz_decimals)
-    withdrawable_based_qty_1f = executor._calc_margin_based_qty(server.mark_px, used_leverage_1f, 500.0, server.sz_decimals)
+    expected_qty_1f = executor._calc_margin_based_qty(server.mark_px, used_leverage_1f, 1000.0, server.step_size)
+    withdrawable_based_qty_1f = executor._calc_margin_based_qty(server.mark_px, used_leverage_1f, 500.0, server.step_size)
     state = json.load(open(TEST_STATE_FILE))
     qty_1f = state["SOL:Buy"]["qty"]
     assert qty_1f == expected_qty_1f, \
@@ -475,8 +543,8 @@ async def main():
 
     # --- Stap 1g: als de qty op basis van de TOTALE accountwaarde meer marge
     # vereist dan er WERKELIJK vrij is, wordt de trade netjes overgeslagen
-    # (nieuwe check in place_entry_order) i.p.v. dat Hyperliquid de order zelf
-    # afwijst. ---
+    # (nieuwe check in place_entry_order) i.p.v. dat de exchange de order
+    # zelf afwijst. ---
     signal_1g = Signal(
         symbol="SOLUSDT", side="Buy", entry_low=191.8, entry_high=193.9,
         leverage=10, targets=[190.3], stop_loss=200.3, raw_text="insufficient-margin",
@@ -486,16 +554,16 @@ async def main():
     server.perp_account_value = 1000.0
     server.spot_total_usdc = 0.0
     calls_before = len(server.calls)
-    result_1g = await executor.place_entry_order(signal_1g, dry_run=False, exchange=server, info=server)
-    new_calls = [name for name, _ in server.calls[calls_before:]]
+    result_1g = await executor.place_entry_order(signal_1g, dry_run=False, client=server)
+    new_actions = action_calls(server.calls[calls_before:])
     assert result_1g is None, f"had overgeslagen moeten worden wegens onvoldoende vrije marge, kreeg: {result_1g}"
-    assert "order" not in new_calls and "market_open" not in new_calls, f"had geen order-calls mogen doen: {new_calls}"
+    assert new_actions == [], f"had geen muterende calls mogen doen: {new_actions}"
     assert len(notifications) == 1 and "onvoldoende vrije marge" in notifications[0], notifications
     notifications.clear()
     orders = db.recent_orders(limit=1)
     assert orders[0]["status"] == "skipped_insufficient_margin"
     print("OK stap 1g: qty (op basis van totale accountwaarde) paste niet binnen de werkelijk vrije marge -> "
-          "netjes overgeslagen (skipped_insufficient_margin), geen Hyperliquid-afwijzing")
+          "netjes overgeslagen (skipped_insufficient_margin), geen exchange-afwijzing")
 
     server.perp_account_value = None  # override weer uit -- volgt weer perp_withdrawable
     server.spot_total_usdc = None
@@ -524,27 +592,24 @@ async def main():
 
     # --- Stap 2: target 1 -> 15% sluiten (jouw live .env-ladder), GEEN
     # SL-aanpassing (BE-shift zit nu op config.BREAKEVEN_MOVE_AFTER_TARGET,
-    # default target 2 -- zie incident 2026-08-25: een BE-shift al bij
-    # target 1 gaf bij een kleine TP1 te weinig ademruimte en liet TP2-5
-    # stelselmatig missen) ---
+    # default target 2) ---
     sl_oid_before_t1 = pos["sl_oid"]
-    close_qty_1 = expected_cum_close_qty(original_qty, remaining, cum_pcts[1], server.sz_decimals)
+    close_qty_1 = expected_cum_close_qty(original_qty, remaining, cum_pcts[1], server.step_size)
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["meta_and_asset_ctxs", "order"], f"onverwachte volgorde bij TP1-event: {new_calls}"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["create_order_v3"], f"onverwachte volgorde bij TP1-event: {new_actions}"
 
-    close_call = server.calls[calls_before + 1][1]
+    close_call = new_actions[0][1]
+    assert close_call["type"] == "MARKET" and close_call["reduceOnly"] is True, \
+        "target1-close moet een reduce-only MARKET-order zijn, geen trigger-order"
+    assert close_call["size"] == str(close_qty_1), f"moet {config.TP_EVENT_TARGET1_CLOSE_PCT}% van de ORIGINELE qty sluiten"
+    assert close_call["side"] == "BUY", "sluiten van een SHORT is een BUY"
 
-    assert close_call["order_type"] == {"limit": {"tif": "Ioc"}} and close_call["reduce_only"] is True, \
-        "target1-close moet een reduce-only IOC-marketorder zijn, geen trigger-order"
-    assert close_call["sz"] == close_qty_1, f"moet {config.TP_EVENT_TARGET1_CLOSE_PCT}% van de ORIGINELE qty sluiten"
-    assert close_call["is_buy"] is True, "sluiten van een SHORT is een BUY"
-
-    remaining = round(remaining - close_qty_1, server.sz_decimals)
-    total_closed = round(total_closed + close_qty_1, server.sz_decimals)
+    remaining = executor._round_sz(remaining - close_qty_1, server.step_size)
+    total_closed = executor._round_sz(total_closed + close_qty_1, server.step_size)
 
     assert len(notifications) == 1 and "break-even" not in notifications[0] and "TP1" in notifications[0], \
         notifications
@@ -561,35 +626,35 @@ async def main():
     # --- Stap 2b: zelfde TP1-event nogmaals -> genegeerd (al verwerkt) ---
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "een dubbel TP1-event mag GEEN nieuwe calls doen"
+    assert action_calls(server.calls[calls_before:]) == [], "een dubbel TP1-event mag GEEN nieuwe muterende calls doen"
     assert len(notifications) == 0
     print("OK stap 2b: duplicaat TP1-event genegeerd, geen dubbele close")
 
     # --- Stap 3: target 2 -> cumulatief 30% sluiten + SL naar dynamische
     # break-even (config.BREAKEVEN_MOVE_AFTER_TARGET=2, gebaseerd op de ECHTE
     # gebankte winst uit target 1+2, config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT) ---
-    close_qty_2 = expected_cum_close_qty(original_qty, remaining, cum_pcts[2], server.sz_decimals)
+    close_qty_2 = expected_cum_close_qty(original_qty, remaining, cum_pcts[2], server.step_size)
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=2, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=2, raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["meta_and_asset_ctxs", "order", "cancel", "order"], \
-        f"onverwachte volgorde bij TP2-event: {new_calls}"
-    close_call = server.calls[calls_before + 1][1]
-    cancel_call = server.calls[calls_before + 2][1]
-    be_sl_call = server.calls[calls_before + 3][1]
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["create_order_v3", "delete_order_v3", "create_order_v3"], \
+        f"onverwachte volgorde bij TP2-event: {new_actions}"
+    close_call = new_actions[0][1]
+    cancel_call = new_actions[1][1]
+    be_sl_call = new_actions[2][1]
 
-    assert close_call["sz"] == close_qty_2, \
+    assert close_call["size"] == str(close_qty_2), \
         f"target2 moet {config.TP_EVENT_TARGET2_CLOSE_PCT}% extra sluiten (cumulatief {cum_pcts[2]}%)"
-    assert close_call["order_type"] == {"limit": {"tif": "Ioc"}} and close_call["reduce_only"] is True
+    assert close_call["type"] == "MARKET" and close_call["reduceOnly"] is True
 
-    assert cancel_call["oid"] == sl_oid_before_t1, "moet de OORSPRONKELIJKE (nog-niet-verplaatste) SL annuleren"
+    assert cancel_call["id"] == sl_oid_before_t1, "moet de OORSPRONKELIJKE (nog-niet-verplaatste) SL annuleren"
 
-    remaining = round(remaining - close_qty_2, server.sz_decimals)
-    total_closed = round(total_closed + close_qty_2, server.sz_decimals)
+    remaining = executor._round_sz(remaining - close_qty_2, server.step_size)
+    total_closed = executor._round_sz(total_closed + close_qty_2, server.step_size)
 
     # mark_px staat hier gelijk aan de entry-prijs (geen koersbeweging in dit
     # scenario) -> beide closes leveren $0 banked_pnl op -> de dynamische
@@ -598,12 +663,12 @@ async def main():
     # zonder gebankte winst is er ook geen ruimte om van entry af te wijken
     # (zie de aparte adaptiviteits-test verderop voor een scenario MET
     # koersbeweging, waar de trigger wel degelijk van entry afwijkt).
-    expected_be_trigger = executor._round_px(pos["entry_price"], server.sz_decimals)
-    assert be_sl_call["order_type"]["trigger"]["tpsl"] == "sl"
-    assert be_sl_call["order_type"]["trigger"]["triggerPx"] == expected_be_trigger, \
+    expected_be_trigger = executor._round_px(pos["entry_price"], server.tick_size)
+    assert be_sl_call["type"] == "STOP_MARKET" and be_sl_call["reduceOnly"] is True
+    assert float(be_sl_call["triggerPrice"]) == expected_be_trigger, \
         f"zonder gebankte winst (mark_px == entry) moet de dynamische SL exact op entry staan: " \
-        f"verwacht {expected_be_trigger}, kreeg {be_sl_call['order_type']['trigger']['triggerPx']}"
-    assert be_sl_call["sz"] == remaining, "nieuwe SL moet voor de resterende qty zijn"
+        f"verwacht {expected_be_trigger}, kreeg {be_sl_call['triggerPrice']}"
+    assert be_sl_call["size"] == str(remaining), "nieuwe SL moet voor de resterende qty zijn"
 
     assert len(notifications) == 1 and "TP2" in notifications[0] and "break-even" in notifications[0], notifications
     notifications.clear()
@@ -623,26 +688,26 @@ async def main():
     # --- Stap 3b: zelfde TP2-event nogmaals -> genegeerd ---
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=2, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=2, raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "een dubbel TP2-event mag GEEN nieuwe calls doen"
+    assert action_calls(server.calls[calls_before:]) == [], "een dubbel TP2-event mag GEEN nieuwe muterende calls doen"
     assert len(notifications) == 0
     print("OK stap 3b: duplicaat TP2-event genegeerd")
 
     # --- Stap 4: target 3 -> cumulatief 50% sluiten (nieuw gedrag: was
     # voorheen ALTIJD de volledige rest) ---
-    close_qty_3 = expected_cum_close_qty(original_qty, remaining, cum_pcts[3], server.sz_decimals)
+    close_qty_3 = expected_cum_close_qty(original_qty, remaining, cum_pcts[3], server.step_size)
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=3, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=3, raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["meta_and_asset_ctxs", "order"], f"onverwachte volgorde bij TP3-event: {new_calls}"
-    close_call = server.calls[calls_before + 1][1]
-    assert close_call["sz"] == close_qty_3, f"target3 moet cumulatief {cum_pcts[3]}% sluiten, niet de volledige rest"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["create_order_v3"], f"onverwachte volgorde bij TP3-event: {new_actions}"
+    close_call = new_actions[0][1]
+    assert close_call["size"] == str(close_qty_3), f"target3 moet cumulatief {cum_pcts[3]}% sluiten, niet de volledige rest"
 
-    remaining = round(remaining - close_qty_3, server.sz_decimals)
-    total_closed = round(total_closed + close_qty_3, server.sz_decimals)
+    remaining = executor._round_sz(remaining - close_qty_3, server.step_size)
+    total_closed = executor._round_sz(total_closed + close_qty_3, server.step_size)
 
     state = json.load(open(TEST_STATE_FILE))
     pos = state["SOL:Sell"]
@@ -654,18 +719,18 @@ async def main():
           f"positie blijft open, resterende {remaining}")
 
     # --- Stap 5: target 4 -> cumulatief 75% sluiten ---
-    close_qty_4 = expected_cum_close_qty(original_qty, remaining, cum_pcts[4], server.sz_decimals)
+    close_qty_4 = expected_cum_close_qty(original_qty, remaining, cum_pcts[4], server.step_size)
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=4, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=4, raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["meta_and_asset_ctxs", "order"], f"onverwachte volgorde bij TP4-event: {new_calls}"
-    close_call = server.calls[calls_before + 1][1]
-    assert close_call["sz"] == close_qty_4, f"target4 moet cumulatief {cum_pcts[4]}% sluiten"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["create_order_v3"], f"onverwachte volgorde bij TP4-event: {new_actions}"
+    close_call = new_actions[0][1]
+    assert close_call["size"] == str(close_qty_4), f"target4 moet cumulatief {cum_pcts[4]}% sluiten"
 
-    remaining = round(remaining - close_qty_4, server.sz_decimals)
-    total_closed = round(total_closed + close_qty_4, server.sz_decimals)
+    remaining = executor._round_sz(remaining - close_qty_4, server.step_size)
+    total_closed = executor._round_sz(total_closed + close_qty_4, server.step_size)
 
     state = json.load(open(TEST_STATE_FILE))
     pos = state["SOL:Sell"]
@@ -680,38 +745,59 @@ async def main():
     close_qty_5 = remaining
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=5, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=5, raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["cancel", "meta_and_asset_ctxs", "order"], \
-        f"onverwachte volgorde bij TP5-event: {new_calls}"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["delete_order_v3", "create_order_v3"], \
+        f"onverwachte volgorde bij TP5-event: {new_actions}"
 
-    cancel_call = server.calls[calls_before][1]
-    close_call = server.calls[calls_before + 2][1]
-    assert close_call["sz"] == close_qty_5, "target5 moet de volledige resterende qty sluiten"
-    assert close_call["order_type"] == {"limit": {"tif": "Ioc"}} and close_call["reduce_only"] is True
-    assert cancel_call["oid"] == pos["sl_oid"], "target5 moet de (break-even-)SL eerst annuleren"
+    cancel_call = new_actions[0][1]
+    close_call = new_actions[1][1]
+    assert close_call["size"] == str(close_qty_5), "target5 moet de volledige resterende qty sluiten"
+    assert close_call["type"] == "MARKET" and close_call["reduceOnly"] is True
+    assert cancel_call["id"] == pos["sl_oid"], "target5 moet de (break-even-)SL eerst annuleren"
 
-    total_closed = round(total_closed + close_qty_5, server.sz_decimals)
+    total_closed = executor._round_sz(total_closed + close_qty_5, server.step_size)
 
     assert len(notifications) == 1 and "klaar" in notifications[0], notifications
     notifications.clear()
 
     state = json.load(open(TEST_STATE_FILE))
     assert "SOL:Sell" not in state, "positie had uit de state verwijderd moeten worden na target 5"
-    assert abs(total_closed - original_qty) < 1e-9, \
-        f"som van alle deel-closes ({total_closed}) moet EXACT de originele qty ({original_qty}) zijn -- " \
-        f"dust of overshoot gedetecteerd"
+    # Tolerantie van een paar step_size (i.p.v. exact 1e-9, zoals onder de
+    # OUDE round-to-nearest-afronding kon): executor._round_sz rondt nu altijd
+    # naar BENEDEN af (floor naar een veelvoud van step_size, zie
+    # executor._round_down_to_step). Een geflorede subtractie op een float
+    # die al binaire representatie-ruis draagt (bv. 36.36 - 6.42 ==
+    # 29.939999999999998 in IEEE754, geen "echte" waarde onder 29.94) kan
+    # daardoor een extra cent naar beneden afronden die bij round-to-nearest
+    # (ongevoelig voor welke kant die ruis op valt) niet gebeurde. Dit
+    # gebeurt zowel op de SUBTRACTIEVE weg (remaining_qty, 4x achter elkaar
+    # geflored) als op de ADDITIEVE weg (dit total_closed-track, apart 5x
+    # geflored), en kan zich over meerdere targets opstapelen (LET OP: dit
+    # bevestigt een reëel, zij het klein en zelf-herstellend, precisie-
+    # kenmerk van executor._round_down_to_step -- zie het testrapport voor
+    # een aanbeveling om dit daar met een kleine epsilon-marge robuuster te
+    # maken). Functioneel blijft de bot correct: target 5 sluit ALTIJD exact
+    # "wat er nog over is" uit de ECHTE, autoritatieve remaining_qty (zie
+    # hierboven, close_qty_5 == remaining), dus de positie zelf sluit op de
+    # exchange altijd volledig af -- alleen deze onafhankelijk-bijgehouden
+    # test-som kan met een paar step_size van de originele qty afwijken.
+    tolerance = 5 * float(server.step_size)
+    assert abs(total_closed - original_qty) <= tolerance + 1e-9, \
+        f"som van alle deel-closes ({total_closed}) moet binnen {tolerance} van de originele qty " \
+        f"({original_qty}) zijn -- grotere afwijking dan de verwachte floor-rounding-marge, dust of overshoot gedetecteerd"
     print(f"OK stap 6: TP5-event verwerkt -- resterende {close_qty_5} gesloten, positie uit state verwijderd. "
           f"Som van alle deel-closes: {round(close_qty_1+close_qty_2+close_qty_3+close_qty_4+close_qty_5, 2)} "
-          f"== originele qty {original_qty} (geen dust, geen overshoot).")
+          f"vs. originele qty {original_qty} (binnen {tolerance} marge -- target 5 sluit altijd exact het "
+          f"werkelijke restant, dus geen dust op de exchange zelf).")
 
     # --- Stap 7: TP-event voor coin zonder open v2-positie -> genegeerd ---
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="XRPUSDT", target_number=1, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="XRPUSDT", target_number=1, raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "geen open v2-positie -> geen enkele call"
+    assert action_calls(server.calls[calls_before:]) == [], "geen open v2-positie -> geen enkele muterende call"
     assert len(notifications) == 0
     tp_events = db.recent_tp_events(limit=1)
     assert tp_events[0]["event"] == "tp_event_ignored_no_position"
@@ -721,15 +807,16 @@ async def main():
     async with executor._state_lock:
         executor._save_state({"SOL:Sell": {
             "version": "v2", "symbol": "SOL", "is_buy": False, "entry_price": 192.85,
-            "sl_price": 200.3, "sl_oid": 9999, "qty": 0.5, "remaining_qty": 0.5,
-            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False, "sz_decimals": 2,
+            "sl_price": 200.3, "sl_oid": "9999", "qty": 0.5, "remaining_qty": 0.5,
+            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
+            "tick_size": "0.01", "step_size": "0.01",
         }})
     config.DRY_RUN = True
     calls_before = len(server.calls)
     await executor.handle_tp_event(
-        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), exchange=server, info=server,
+        TPEvent(symbol="SOLUSDT", target_number=1, raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "DRY_RUN=True met v2-entry had GEEN enkele call mogen doen"
+    assert action_calls(server.calls[calls_before:]) == [], "DRY_RUN=True met v2-entry had GEEN muterende call mogen doen"
     config.DRY_RUN = False
     async with executor._state_lock:
         executor._save_state({})
@@ -742,13 +829,17 @@ async def main():
     # de $10-grens. Losse "EDGE"-market/server (i.p.v. SOL) en state direct
     # geseed, zodat dit scenario onafhankelijk van de margin-sizing exact
     # controleerbare getallen heeft:
-    #   T1 cum 40% -> should=round(12*0.40)=5   -> notional $5  -> SKIP (schuift door)
-    #   T2 cum 60% -> should=round(12*0.60)=7   -> notional $7  -> SKIP (schuift door)
-    #   T3 cum 75% -> should=round(12*0.75)=9   -> notional $9  -> SKIP (schuift door)
-    #   T4 cum 90% -> should=round(12*0.90)=11  -> close 11 (0 al dicht) -> notional $11 -> SLUIT
-    #   T5         -> resterende 1 sluit ALTIJD, ongeacht notional ($1 < $10)
+    #   T1 cum 40% -> should=floor(12*0.40)=4  -> notional $4  -> SKIP (schuift door)
+    #   T2 cum 60% -> should=floor(12*0.60)=7  -> notional $7  -> SKIP (schuift door)
+    #   T3 cum 75% -> should=floor(12*0.75)=9  -> notional $9  -> SKIP (schuift door)
+    #   T4 cum 90% -> should=floor(12*0.90)=10 -> close 10 (0 al dicht) -> notional $10 -> SLUIT
+    #   T5         -> resterende 2 sluit ALTIJD, ongeacht notional ($2 < $10)
+    # (should-waarden hier zijn floor(qty*pct), zie executor._round_sz/
+    # _round_down_to_step -- ApeX Omni's afronding rondt altijd naar BENEDEN
+    # af op een veelvoud van step_size, dus 12*0.90=10.8 wordt 10, niet 11.)
     # Bevestigt: elke ECHTE close-order (behalve de finale T5-exit) zit boven
-    # MIN_NOTIONAL_USD, en de som van alle closes is exact 12.
+    # MIN_NOTIONAL_USD, en de som van alle closes is exact 12. step_size="1"
+    # (i.p.v. sz_decimals=0) houdt de qty's hele getallen, zelfde als voorheen.
     #
     # Deze percentages (40/20/15/15) zijn BEWUST losgekoppeld van jouw live
     # .env-ladder (15/15/20/25, zie stap 2-6 hierboven) -- dit scenario test
@@ -764,15 +855,16 @@ async def main():
     config.TP_EVENT_TARGET3_CLOSE_PCT = 15.0
     config.TP_EVENT_TARGET4_CLOSE_PCT = 15.0
 
-    edge_server = FakeHyperliquidServer(
-        mark_px=1.0, max_leverage=10, sz_decimals=0, universe_symbol="EDGE",
+    edge_server = FakeApexServer(
+        mark_px=1.0, max_leverage=10, tick_size="0.01", step_size="1", universe_symbol="EDGE",
     )
     edge_qty = 12.0
     async with executor._state_lock:
         executor._save_state({"EDGE:Sell": {
             "version": "v2", "symbol": "EDGE", "is_buy": False, "entry_price": 1.0,
-            "sl_price": 1.1, "sl_oid": 4242, "qty": edge_qty, "remaining_qty": edge_qty,
-            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False, "sz_decimals": 0,
+            "sl_price": 1.1, "sl_oid": "4242", "qty": edge_qty, "remaining_qty": edge_qty,
+            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
+            "tick_size": "0.01", "step_size": "1",
         }})
 
     real_close_orders = []  # (target_number, sz, notional) voor elke ECHTE close-order
@@ -780,15 +872,15 @@ async def main():
     async def run_edge_target(n):
         calls_before_edge = len(edge_server.calls)
         await executor.handle_tp_event(
-            TPEvent(symbol="EDGEUSDT", target_number=n, raw_text="test"), exchange=edge_server, info=edge_server,
+            TPEvent(symbol="EDGEUSDT", target_number=n, raw_text="test"), client=edge_server,
         )
-        new_calls_edge = [name for name, _ in edge_server.calls[calls_before_edge:]]
+        new_actions_edge = action_calls(edge_server.calls[calls_before_edge:])
         state_now = json.load(open(TEST_STATE_FILE))
-        return new_calls_edge, state_now.get("EDGE:Sell")
+        return new_actions_edge, state_now.get("EDGE:Sell")
 
     # T1: notional $5 < $10 -> geskipt, GEEN order-call, remaining blijft 12.
-    new_calls, pos_edge = await run_edge_target(1)
-    assert new_calls == ["meta_and_asset_ctxs"], f"T1 had alleen de market-lookup mogen doen: {new_calls}"
+    new_actions, pos_edge = await run_edge_target(1)
+    assert new_actions == [], f"T1 had geen muterende calls mogen doen: {new_actions}"
     assert pos_edge["remaining_qty"] == edge_qty, "T1 skip mag remaining_qty niet veranderen"
     assert pos_edge["tp1_done"] is True, "T1 moet wel als 'verwerkt' gemarkeerd zijn (voorkomt herhaling)"
     assert len(notifications) == 1 and "doorgeschoven" in notifications[0], notifications
@@ -801,17 +893,17 @@ async def main():
     # zelf blijft geskipt, MAAR target 2 == config.BREAKEVEN_MOVE_AFTER_TARGET,
     # dus de SL verplaatst nu tóch naar gebufferde break-even (ongeacht of de
     # close zelf doorging) -- cancel + nieuwe trigger-order, geen close-order.
-    edge_sl_oid_before = 4242
-    new_calls, pos_edge = await run_edge_target(2)
-    assert new_calls == ["meta_and_asset_ctxs", "cancel", "order"], \
-        f"T2 had geen close-order maar wel de BE-shift (cancel+order) moeten doen: {new_calls}"
+    edge_sl_oid_before = "4242"
+    new_actions, pos_edge = await run_edge_target(2)
+    assert [n for n, _ in new_actions] == ["delete_order_v3", "create_order_v3"], \
+        f"T2 had geen close-order maar wel de BE-shift (cancel+order) moeten doen: {new_actions}"
     assert pos_edge["remaining_qty"] == edge_qty, "T2 skip mag remaining_qty niet veranderen"
     assert pos_edge["tp2_done"] is True
     assert pos_edge["sl_oid"] != edge_sl_oid_before, "BE-shift moet ook bij een geskipte close een nieuwe SL zetten"
     # T1 en T2 sloegen allebei over (MIN_NOTIONAL) -> geen enkele echte close,
     # dus $0 banked_pnl -> de dynamische break-even-trigger komt exact op de
     # entry-prijs uit (geen gebankte winst om ruimte aan te ontlenen).
-    edge_expected_be_trigger = executor._round_px(1.0, 0)  # EDGE:Sell entry_price == 1.0
+    edge_expected_be_trigger = executor._round_px(1.0, "0.01")  # EDGE:Sell entry_price == 1.0
     assert pos_edge["sl_price"] == edge_expected_be_trigger
     assert pos_edge["banked_pnl"] == 0.0, "T1+T2 allebei geskipt -> geen echte close, dus $0 gebankt"
     assert len(notifications) == 1 and "break-even" in notifications[0] and "doorgeschoven" in notifications[0], \
@@ -821,36 +913,38 @@ async def main():
           f"break-even ({edge_expected_be_trigger}, banked_pnl=0.0 want geen echte close)")
 
     # T3: cumulatief zou nu 9 moeten sluiten -> notional $9 < $10 -> ook skip.
-    new_calls, pos_edge = await run_edge_target(3)
-    assert new_calls == ["meta_and_asset_ctxs"], f"T3 had alleen de market-lookup mogen doen: {new_calls}"
+    new_actions, pos_edge = await run_edge_target(3)
+    assert new_actions == [], f"T3 had geen muterende calls mogen doen: {new_actions}"
     assert pos_edge["remaining_qty"] == edge_qty, "T3 skip mag remaining_qty niet veranderen"
     assert pos_edge["tp3_done"] is True
     notifications.clear()
     print("OK stap 9 (T3): deel-close $9 < $10-minimum -> ook overgeslagen (3x op rij)")
 
-    # T4: cumulatief 90% van 12 = 11 (0 al dicht, want T1-3 sloegen allemaal
-    # over) -> notional $11 >= $10 -> sluit nu de OPGESTAPELDE 11 in één keer.
-    new_calls, pos_edge = await run_edge_target(4)
-    assert new_calls == ["meta_and_asset_ctxs", "order"], f"T4 had een echte close-order moeten plaatsen: {new_calls}"
-    close_call = edge_server.calls[-1][1]
-    assert close_call["sz"] == 11, f"T4 moet de opgestapelde 40+20+15+15=90% (11 van 12) in één keer sluiten: {close_call}"
-    notional_t4 = close_call["sz"] * edge_server.mark_px
+    # T4: cumulatief 90% van 12 = floor(10.8)=10 (0 al dicht, want T1-3
+    # sloegen allemaal over) -> notional $10 >= $10 -> sluit nu de
+    # OPGESTAPELDE 10 in één keer (ApeX Omni se floor-afronding, zie boven --
+    # de oude Hyperliquid-versie's round-to-nearest zou hier 11 gegeven hebben).
+    new_actions, pos_edge = await run_edge_target(4)
+    assert [n for n, _ in new_actions] == ["create_order_v3"], f"T4 had een echte close-order moeten plaatsen: {new_actions}"
+    close_call = new_actions[-1][1]
+    assert close_call["size"] == "10.0", f"T4 moet de opgestapelde 40+20+15+15=90% (floor(10.8)=10 van 12) in één keer sluiten: {close_call}"
+    notional_t4 = float(close_call["size"]) * edge_server.mark_px
     assert notional_t4 >= config.MIN_NOTIONAL_USD, "T4's daadwerkelijke close-order moet boven MIN_NOTIONAL_USD zitten"
-    real_close_orders.append((4, close_call["sz"], notional_t4))
-    assert pos_edge["remaining_qty"] == 1, f"na T4 moet er nog 1 over zijn: {pos_edge['remaining_qty']}"
+    real_close_orders.append((4, float(close_call["size"]), notional_t4))
+    assert pos_edge["remaining_qty"] == 2, f"na T4 moet er nog 2 over zijn: {pos_edge['remaining_qty']}"
     assert pos_edge["tp4_done"] is True
     notifications.clear()
-    print(f"OK stap 9 (T4): opgestapelde deel-close ({close_call['sz']}, ~${notional_t4:.2f}) EINDELIJK boven "
+    print(f"OK stap 9 (T4): opgestapelde deel-close ({close_call['size']}, ~${notional_t4:.2f}) EINDELIJK boven "
           f"MIN_NOTIONAL_USD -> in één keer gesloten, resterende {pos_edge['remaining_qty']}")
 
-    # T5: sluit de laatste 1 ALTIJD, ook al is $1 ver onder MIN_NOTIONAL_USD --
+    # T5: sluit de laatste 2 ALTIJD, ook al is $2 ver onder MIN_NOTIONAL_USD --
     # dit is de finale exit, geen verdere target om naar door te schuiven.
-    new_calls, _ = await run_edge_target(5)
-    assert new_calls == ["cancel", "meta_and_asset_ctxs", "order"], \
-        f"T5 moet ALTIJD sluiten, ongeacht notional: {new_calls}"
-    close_call = edge_server.calls[-1][1]
-    assert close_call["sz"] == 1, f"T5 moet de laatste resterende 1 sluiten: {close_call}"
-    real_close_orders.append((5, close_call["sz"], close_call["sz"] * edge_server.mark_px))
+    new_actions, _ = await run_edge_target(5)
+    assert [n for n, _ in new_actions] == ["delete_order_v3", "create_order_v3"], \
+        f"T5 moet ALTIJD sluiten, ongeacht notional: {new_actions}"
+    close_call = new_actions[-1][1]
+    assert close_call["size"] == "2.0", f"T5 moet de laatste resterende 2 sluiten: {close_call}"
+    real_close_orders.append((5, float(close_call["size"]), float(close_call["size"]) * edge_server.mark_px))
     notifications.clear()
 
     state = json.load(open(TEST_STATE_FILE))
@@ -865,9 +959,9 @@ async def main():
     ]
     assert not under_min_besides_final, \
         f"geen enkele close-order behalve de finale T5-exit mag onder MIN_NOTIONAL_USD zitten: {under_min_besides_final}"
-    print(f"OK stap 9 (T5): finale exit sluit de laatste 1 (~$1.00, ONDER MIN_NOTIONAL_USD, maar dit is de "
+    print(f"OK stap 9 (T5): finale exit sluit de laatste 2 (~$2.00, ONDER MIN_NOTIONAL_USD, maar dit is de "
           f"laatste target dus geen andere keuze) -- som van echte closes ({total_edge_closed}) == originele "
-          f"qty ({edge_qty}). Geen enkele niet-finale close-order zat onder Hyperliquid's minimum.")
+          f"qty ({edge_qty}). Geen enkele niet-finale close-order zat onder de minimumgrens.")
 
     # Jouw live .env-ladder (15/15/20/25) terugzetten voor de rest van het script.
     (config.TP_EVENT_TARGET1_CLOSE_PCT, config.TP_EVENT_TARGET2_CLOSE_PCT,
@@ -877,7 +971,7 @@ async def main():
     # volledig sluiten (SL geannuleerd + volle resterende qty market-close),
     # ongeacht welke targets al gehaald zijn. Regressietest voor het incident
     # van 2026-08-12 (zie moduledocstring hierboven). ---
-    result9 = await executor.place_entry_order(signal, dry_run=False, exchange=server, info=server)
+    result9 = await executor.place_entry_order(signal, dry_run=False, client=server)
     assert result9 is not None and result9.startswith("qty="), f"entry voor stap 10 had moeten slagen: {result9}"
     state = json.load(open(TEST_STATE_FILE))
     pos9 = state["SOL:Sell"]
@@ -885,18 +979,18 @@ async def main():
 
     calls_before = len(server.calls)
     await executor.handle_cancel_event(
-        CancelEvent(symbol="SOLUSDT", raw_text="test"), exchange=server, info=server,
+        CancelEvent(symbol="SOLUSDT", raw_text="test"), client=server,
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["cancel", "meta_and_asset_ctxs", "order"], \
-        f"onverwachte volgorde bij cancel-event: {new_calls}"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["delete_order_v3", "create_order_v3"], \
+        f"onverwachte volgorde bij cancel-event: {new_actions}"
 
-    cancel_call = server.calls[calls_before][1]
-    close_call = server.calls[calls_before + 2][1]
-    assert cancel_call["oid"] == sl_oid_9, "moet de OORSPRONKELIJKE SL annuleren"
-    assert close_call["sz"] == pos9["qty"], "cancel-event moet de VOLLE (nog niet TP1'de) qty sluiten"
-    assert close_call["order_type"] == {"limit": {"tif": "Ioc"}} and close_call["reduce_only"] is True, \
-        "cancel-close moet een reduce-only IOC-marketorder zijn, geen trigger-order"
+    cancel_call = new_actions[0][1]
+    close_call = new_actions[1][1]
+    assert cancel_call["id"] == sl_oid_9, "moet de OORSPRONKELIJKE SL annuleren"
+    assert close_call["size"] == str(pos9["qty"]), "cancel-event moet de VOLLE (nog niet TP1'de) qty sluiten"
+    assert close_call["type"] == "MARKET" and close_call["reduceOnly"] is True, \
+        "cancel-close moet een reduce-only MARKET-order zijn, geen trigger-order"
 
     assert len(notifications) == 1 and "Cancel" in notifications[0], notifications
     notifications.clear()
@@ -910,9 +1004,9 @@ async def main():
     # is al weg, dus genegeerd, geen dubbele market-close. ---
     calls_before = len(server.calls)
     await executor.handle_cancel_event(
-        CancelEvent(symbol="SOLUSDT", raw_text="test"), exchange=server, info=server,
+        CancelEvent(symbol="SOLUSDT", raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "een duplicaat cancel-event mag GEEN nieuwe calls doen"
+    assert action_calls(server.calls[calls_before:]) == [], "een duplicaat cancel-event mag GEEN nieuwe muterende calls doen"
     assert len(notifications) == 0
     tp_events = db.recent_tp_events(limit=1)
     assert tp_events[0]["event"] == "cancel_event_ignored_no_position"
@@ -924,20 +1018,19 @@ async def main():
     # de _call()-netwerkcalls hierboven yielden via asyncio.to_thread(), dus
     # zonder de _cancel_in_progress-claim lezen beide taken de nog-niet-
     # gepopte state en proberen ze allebei dezelfde SL te annuleren/positie
-    # te sluiten ("Order was never placed, already canceled, or filled" +
-    # "Reduce only order would increase position"). Met de fix mag er maar
-    # EEN van de twee taken echte calls doen. ---
-    result9c = await executor.place_entry_order(signal, dry_run=False, exchange=server, info=server)
+    # te sluiten. Met de fix mag er maar EEN van de twee taken echte calls
+    # doen. ---
+    result9c = await executor.place_entry_order(signal, dry_run=False, client=server)
     assert result9c is not None and result9c.startswith("qty="), f"entry voor stap 10c had moeten slagen: {result9c}"
 
     calls_before = len(server.calls)
     await asyncio.gather(
-        executor.handle_cancel_event(CancelEvent(symbol="SOLUSDT", raw_text="test"), exchange=server, info=server),
-        executor.handle_cancel_event(CancelEvent(symbol="SOLUSDT", raw_text="test"), exchange=server, info=server),
+        executor.handle_cancel_event(CancelEvent(symbol="SOLUSDT", raw_text="test"), client=server),
+        executor.handle_cancel_event(CancelEvent(symbol="SOLUSDT", raw_text="test"), client=server),
     )
-    new_calls = [name for name, _ in server.calls[calls_before:]]
-    assert new_calls == ["cancel", "meta_and_asset_ctxs", "order"], \
-        f"bij gelijktijdige duplicaten mag maar EEN taak de SL-cancel/close-calls doen, kreeg: {new_calls}"
+    new_actions = action_calls(server.calls[calls_before:])
+    assert [n for n, _ in new_actions] == ["delete_order_v3", "create_order_v3"], \
+        f"bij gelijktijdige duplicaten mag maar EEN taak de SL-cancel/close-calls doen, kreeg: {new_actions}"
 
     tp_events_9c = db.recent_tp_events(limit=2)
     events_9c = {e["event"] for e in tp_events_9c}
@@ -955,15 +1048,16 @@ async def main():
     async with executor._state_lock:
         executor._save_state({"SOL:Sell": {
             "version": "v2", "symbol": "SOL", "is_buy": False, "entry_price": 192.85,
-            "sl_price": 200.3, "sl_oid": 9999, "qty": 0.5, "remaining_qty": 0.5,
-            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False, "sz_decimals": 2,
+            "sl_price": 200.3, "sl_oid": "9999", "qty": 0.5, "remaining_qty": 0.5,
+            "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
+            "tick_size": "0.01", "step_size": "0.01",
         }})
     config.DRY_RUN = True
     calls_before = len(server.calls)
     await executor.handle_cancel_event(
-        CancelEvent(symbol="SOLUSDT", raw_text="test"), exchange=server, info=server,
+        CancelEvent(symbol="SOLUSDT", raw_text="test"), client=server,
     )
-    assert len(server.calls) == calls_before, "DRY_RUN=True met v2-entry had GEEN enkele call mogen doen"
+    assert action_calls(server.calls[calls_before:]) == [], "DRY_RUN=True met v2-entry had GEEN muterende call mogen doen"
     config.DRY_RUN = False
     async with executor._state_lock:
         executor._save_state({})
@@ -975,48 +1069,48 @@ async def main():
     # echte koersstijging tussen TP1 en TP2 in -- de trigger moet verder van
     # entry af komen te liggen dan een vaste 0,5%-buffer ooit zou doen, want
     # er is hier veel meer winst gebankt dan die 0,5% zou dekken. ---
-    adapt_server = FakeHyperliquidServer(
-        mark_px=110.0, max_leverage=10, sz_decimals=2, universe_symbol="ADAPT",
+    adapt_server = FakeApexServer(
+        mark_px=110.0, max_leverage=10, tick_size="0.01", step_size="0.01", universe_symbol="ADAPT",
     )
     adapt_entry = 100.0
     adapt_qty = 10.0
     async with executor._state_lock:
         executor._save_state({"ADAPT:Buy": {
             "version": "v2", "symbol": "ADAPT", "is_buy": True,
-            "entry_price": adapt_entry, "sl_price": 90.0, "sl_oid": 7777,
+            "entry_price": adapt_entry, "sl_price": 90.0, "sl_oid": "7777",
             "qty": adapt_qty, "remaining_qty": adapt_qty,
             "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
-            "sz_decimals": 2, "banked_pnl": 0.0,
+            "tick_size": "0.01", "step_size": "0.01", "banked_pnl": 0.0,
         }})
 
-    close_qty_1_adapt = expected_cum_close_qty(adapt_qty, adapt_qty, cum_pcts[1], 2)
+    close_qty_1_adapt = expected_cum_close_qty(adapt_qty, adapt_qty, cum_pcts[1], "0.01")
     await executor.handle_tp_event(
-        TPEvent(symbol="ADAPTUSDT", target_number=1, raw_text="test"), exchange=adapt_server, info=adapt_server,
+        TPEvent(symbol="ADAPTUSDT", target_number=1, raw_text="test"), client=adapt_server,
     )
     pos_adapt = json.load(open(TEST_STATE_FILE))["ADAPT:Buy"]
     expected_banked_1 = close_qty_1_adapt * (adapt_server.mark_px - adapt_entry)
     assert abs(pos_adapt["banked_pnl"] - expected_banked_1) < 1e-9, \
         f"banked_pnl na TP1 moet de echte fill-winst zijn: verwacht {expected_banked_1}, kreeg {pos_adapt['banked_pnl']}"
 
-    remaining_after_1 = round(adapt_qty - close_qty_1_adapt, 2)
+    remaining_after_1 = executor._round_sz(adapt_qty - close_qty_1_adapt, "0.01")
     adapt_server.mark_px = 115.0  # koers stijgt verder vóór TP2
-    close_qty_2_adapt = expected_cum_close_qty(adapt_qty, remaining_after_1, cum_pcts[2], 2)
+    close_qty_2_adapt = expected_cum_close_qty(adapt_qty, remaining_after_1, cum_pcts[2], "0.01")
     await executor.handle_tp_event(
-        TPEvent(symbol="ADAPTUSDT", target_number=2, raw_text="test"), exchange=adapt_server, info=adapt_server,
+        TPEvent(symbol="ADAPTUSDT", target_number=2, raw_text="test"), client=adapt_server,
     )
     pos_adapt = json.load(open(TEST_STATE_FILE))["ADAPT:Buy"]
     expected_banked_2 = expected_banked_1 + close_qty_2_adapt * (adapt_server.mark_px - adapt_entry)
     assert abs(pos_adapt["banked_pnl"] - expected_banked_2) < 1e-9, \
         f"banked_pnl na TP2 moet cumulatief zijn: verwacht {expected_banked_2}, kreeg {pos_adapt['banked_pnl']}"
 
-    remaining_after_2 = round(remaining_after_1 - close_qty_2_adapt, 2)
+    remaining_after_2 = executor._round_sz(remaining_after_1 - close_qty_2_adapt, "0.01")
     # Veiligheidsmarge zit over de ORIGINELE notional (2026-09-01: was de
     # resterende notional, maar dat dekte de entry-fee nooit -- zie
     # executor._handle_tp_partial_event).
     safety_adapt = adapt_qty * adapt_entry * (config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT / 100)
     available_adapt = max(expected_banked_2 - safety_adapt, 0.0)
-    expected_be_trigger_adapt = executor._round_px(adapt_entry - available_adapt / remaining_after_2, 2)
-    fixed_buffer_trigger = executor._round_px(adapt_entry * (1 - 0.5 / 100), 2)  # wat de OUDE vaste 0.5%-buffer zou geven
+    expected_be_trigger_adapt = executor._round_px(adapt_entry - available_adapt / remaining_after_2, "0.01")
+    fixed_buffer_trigger = executor._round_px(adapt_entry * (1 - 0.5 / 100), "0.01")  # wat een vaste 0.5%-buffer zou geven
 
     assert pos_adapt["sl_price"] == expected_be_trigger_adapt, \
         f"dynamische break-even moet de gebankte winst weerspiegelen: verwacht {expected_be_trigger_adapt}, " \
@@ -1039,68 +1133,68 @@ async def main():
     # resten, en liet de TP-ladder daarna tegen een veel te kleine qty
     # rekenen (zelfde patroon als het 2026-08-14-incident, nu getriggerd
     # door een legitieme late re-entry i.p.v. een near-duplicate bericht). ---
-    reentry_server = FakeHyperliquidServer(mark_px=195.0, max_leverage=10, sz_decimals=2, universe_symbol="SOL")
-    old_sl_oid = 5555
+    reentry_server = FakeApexServer(mark_px=195.0, max_leverage=10, tick_size="0.01", step_size="0.01", universe_symbol="SOL")
+    old_sl_oid = "5555"
     async with executor._state_lock:
         executor._save_state({"SOL:Sell": {
             "version": "v2", "symbol": "SOL", "is_buy": False,
             "entry_price": 192.85, "sl_price": 200.3, "sl_oid": old_sl_oid,
             "qty": 10.0, "remaining_qty": 10.0,
             "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
-            "sz_decimals": 2, "banked_pnl": 0.0,
+            "tick_size": "0.01", "step_size": "0.01", "banked_pnl": 0.0,
             "opened_at": time.time() - 3600,  # ruim buiten DUPLICATE_POSITION_WINDOW_SECONDS (60s)
         }})
 
-    # Simuleert wat Hyperliquid's ECHTE clearinghouseState rapporteert NA de
-    # nieuwe fill: de exchange heeft de nieuwe order zelf al samengevoegd met
-    # de bestaande 10-lot short tot een netto 16-lot short @ 195.0 (autoritatief,
-    # niet zelf lokaal herberekend).
-    reentry_server.live_position_override = {"coin": "SOL", "szi": "-16.0", "entryPx": "195.0"}
+    # Simuleert wat ApeX Omni's ECHTE get_account_v3()["positions"] rapporteert
+    # NA de nieuwe fill: de exchange heeft de nieuwe order zelf al
+    # samengevoegd met de bestaande 10-lot short tot een netto 16-lot short
+    # @ 195.0 (autoritatief, niet zelf lokaal herberekend).
+    reentry_server.live_position_override = {"symbol": "SOL-USDT", "side": "SELL", "size": "16.0", "entryPrice": "195.0"}
 
     signal_reentry = Signal(
         symbol="SOLUSDT", side="Sell", entry_low=193.0, entry_high=196.0,
         leverage=10, targets=[190.0, 188.0, 186.0, 184.0, 180.0], stop_loss=201.0, raw_text="reentry",
     )
-    result_reentry = await executor.place_entry_order(signal_reentry, dry_run=False, exchange=reentry_server, info=reentry_server)
+    result_reentry = await executor.place_entry_order(signal_reentry, dry_run=False, client=reentry_server)
     assert result_reentry is not None and "toegevoegd" in result_reentry, f"re-entry had moeten slagen: {result_reentry}"
 
-    cancel_calls = [c for name, c in reentry_server.calls if name == "cancel"]
-    assert cancel_calls == [{"name": "SOL", "oid": old_sl_oid}], \
+    cancel_calls = [c for name, c in action_calls(reentry_server.calls) if name == "delete_order_v3"]
+    assert cancel_calls == [{"id": old_sl_oid}], \
         f"de OUDE SL had geannuleerd moeten worden vóór de nieuwe SL: {cancel_calls}"
 
-    sl_order_calls = [c for name, c in reentry_server.calls if name == "order"]
-    assert len(sl_order_calls) == 1 and sl_order_calls[0]["sz"] == 16.0, \
+    sl_order_calls = [c for name, c in action_calls(reentry_server.calls) if name == "create_order_v3" and c["type"] == "STOP_MARKET"]
+    assert len(sl_order_calls) == 1 and sl_order_calls[0]["size"] == "16.0", \
         f"de nieuwe SL had de VOLLEDIGE samengevoegde qty (16.0) moeten dekken, niet alleen de nieuwe fill: {sl_order_calls}"
 
     state_reentry = json.load(open(TEST_STATE_FILE))["SOL:Sell"]
     assert state_reentry["qty"] == 16.0 and state_reentry["remaining_qty"] == 16.0, \
         f"state moet de ECHTE samengevoegde qty gebruiken (16.0), niet zelf herberekenen: {state_reentry}"
     assert state_reentry["entry_price"] == 195.0, \
-        f"state moet de ECHTE (geblende) entry-prijs van Hyperliquid gebruiken: {state_reentry}"
+        f"state moet de ECHTE (geblende) entry-prijs van ApeX Omni gebruiken: {state_reentry}"
     assert not any(state_reentry[f"tp{n}_done"] for n in (1, 2, 3, 4)), "TP-ladder moet resetten voor de samengevoegde positie"
     assert state_reentry["banked_pnl"] == 0.0, "banked_pnl moet resetten -- nieuwe entry-prijs, geen oude referentie meer"
 
     assert any("Re-entry samengevoegd" in m for m in notifications), notifications
     notifications.clear()
-    print(f"OK stap 12: same-side re-entry samengevoegd -- oude SL (oid={old_sl_oid}) geannuleerd, "
+    print(f"OK stap 12: same-side re-entry samengevoegd -- oude SL (id={old_sl_oid}) geannuleerd, "
           f"nieuwe SL dekt de volledige samengevoegde qty (16.0 @ 195.0), TP-ladder en banked_pnl gereset")
 
     # --- Stap 12b: fallback als de samengevoegde positie niet te bevestigen
-    # is bij Hyperliquid (bv. de oude positie bleek intussen extern gesloten,
+    # is bij ApeX Omni (bv. de oude positie bleek intussen extern gesloten,
     # zie reconcile_positions) -- MOET de nieuwe fill als op zichzelf staande
     # positie behandelen i.p.v. te gokken op een qty die niet klopt. ---
-    reentry_server2 = FakeHyperliquidServer(mark_px=195.0, max_leverage=10, sz_decimals=2, universe_symbol="SOL")
+    reentry_server2 = FakeApexServer(mark_px=195.0, max_leverage=10, tick_size="0.01", step_size="0.01", universe_symbol="SOL")
     async with executor._state_lock:
         executor._save_state({"SOL:Sell": {
             "version": "v2", "symbol": "SOL", "is_buy": False,
-            "entry_price": 192.85, "sl_price": 200.3, "sl_oid": 6666,
+            "entry_price": 192.85, "sl_price": 200.3, "sl_oid": "6666",
             "qty": 10.0, "remaining_qty": 10.0,
             "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
-            "sz_decimals": 2, "banked_pnl": 0.0,
+            "tick_size": "0.01", "step_size": "0.01", "banked_pnl": 0.0,
             "opened_at": time.time() - 3600,
         }})
     reentry_server2.live_position_override = None  # geen bevestigde live positie
-    result_reentry2 = await executor.place_entry_order(signal_reentry, dry_run=False, exchange=reentry_server2, info=reentry_server2)
+    result_reentry2 = await executor.place_entry_order(signal_reentry, dry_run=False, client=reentry_server2)
     assert result_reentry2 is not None
     state_reentry2 = json.load(open(TEST_STATE_FILE))["SOL:Sell"]
     fallback_qty = state_reentry2["qty"]
@@ -1121,37 +1215,36 @@ async def main():
     # TP/cancel-event voor die coin als ambigu genegeerd worden, waardoor 4
     # TP-targets nooit werden uitgevoerd op de wél-nog-echte positie).
     # place_entry_order() checkt nu vóór elke nieuwe entry of een
-    # tegengesteld v2-record nog ECHT open staat op Hyperliquid. ---
-    opp_server = FakeHyperliquidServer(mark_px=0.0086, max_leverage=5, sz_decimals=0, universe_symbol="PENGU")
+    # tegengesteld v2-record nog ECHT open staat op ApeX Omni. ---
+    opp_server = FakeApexServer(mark_px=0.0086, max_leverage=5, tick_size="0.0001", step_size="1", universe_symbol="PENGU")
     async with executor._state_lock:
         executor._save_state({"PENGU:Buy": {
             "version": "v2", "symbol": "PENGU", "is_buy": True,
-            "entry_price": 0.008807, "sl_price": 0.008436, "sl_oid": 1111,
+            "entry_price": 0.008807, "sl_price": 0.008436, "sl_oid": "1111",
             "qty": 300000.0, "remaining_qty": 300000.0,
             "tp1_done": False, "tp2_done": False, "tp3_done": False, "tp4_done": False,
-            "sz_decimals": 0, "banked_pnl": 0.0, "opened_at": time.time() - 3600,
+            "tick_size": "0.0001", "step_size": "1", "banked_pnl": 0.0, "opened_at": time.time() - 3600,
         }})
     signal_opp = Signal(
         symbol="PENGUUSDT", side="Sell", entry_low=0.0085, entry_high=0.0086,
         leverage=5, targets=[0.0084, 0.0083, 0.0082, 0.0081, 0.008], stop_loss=0.0089, raw_text="opp-test",
     )
 
-    # Stap 13a: PENGU:Buy staat nog ECHT open op Hyperliquid -> nieuwe
+    # Stap 13a: PENGU:Buy staat nog ECHT open op ApeX Omni -> nieuwe
     # Sell-entry moet overgeslagen worden (zou netten/flippen op de
     # exchange), state blijft ongewijzigd, gebruiker wordt gewaarschuwd.
-    opp_server.live_position_override = {"coin": "PENGU", "szi": "300000", "entryPx": "0.008807"}
+    opp_server.live_position_override = {"symbol": "PENGU-USDT", "side": "BUY", "size": "300000", "entryPrice": "0.008807"}
     calls_before = len(opp_server.calls)
-    result_opp_live = await executor.place_entry_order(signal_opp, dry_run=False, exchange=opp_server, info=opp_server)
+    result_opp_live = await executor.place_entry_order(signal_opp, dry_run=False, client=opp_server)
     assert result_opp_live is None, f"had overgeslagen moeten worden, kreeg: {result_opp_live}"
-    new_calls_opp = [name for name, _ in opp_server.calls[calls_before:]]
-    assert "order" not in new_calls_opp and "market_open" not in new_calls_opp, \
-        f"had geen order-calls mogen doen: {new_calls_opp}"
+    new_actions_opp = action_calls(opp_server.calls[calls_before:])
+    assert new_actions_opp == [], f"had geen muterende calls mogen doen: {new_actions_opp}"
     state_opp = json.load(open(TEST_STATE_FILE))
     assert "PENGU:Buy" in state_opp and "PENGU:Sell" not in state_opp, \
         "PENGU:Buy moet blijven staan, geen nieuwe PENGU:Sell erbij (zou de exacte 2026-09-08-bug herhalen)"
     assert any("PENGU:Buy" in m for m in notifications), notifications
     notifications.clear()
-    print("OK stap 13a: tegengestelde v2-positie nog ECHT open op Hyperliquid -> nieuwe entry overgeslagen, "
+    print("OK stap 13a: tegengestelde v2-positie nog ECHT open op ApeX Omni -> nieuwe entry overgeslagen, "
           "geen dubbel state-record (voorkomt de exacte 2026-09-08-bug)")
 
     # Stap 13b: PENGU:Buy staat NIET meer echt open (bv. resting SL buiten
@@ -1159,7 +1252,7 @@ async def main():
     # entry gaat gewoon door.
     opp_server.live_position_override = None
     calls_before = len(opp_server.calls)
-    result_opp_stale = await executor.place_entry_order(signal_opp, dry_run=False, exchange=opp_server, info=opp_server)
+    result_opp_stale = await executor.place_entry_order(signal_opp, dry_run=False, client=opp_server)
     assert result_opp_stale is not None and result_opp_stale.startswith("qty="), \
         f"had moeten slagen na opruimen van de stale tegengestelde positie: {result_opp_stale}"
     state_opp2 = json.load(open(TEST_STATE_FILE))

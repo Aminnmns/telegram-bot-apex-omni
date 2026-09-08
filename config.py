@@ -32,37 +32,44 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "signal_bot_session")
 TELEGRAM_GROUP = os.getenv("TELEGRAM_GROUP", "")  # groep username, invite-link of chat-ID
 TELEGRAM_NOTIFY_CHAT = os.getenv("TELEGRAM_NOTIFY_CHAT", "")  # waar de bot JOU updates stuurt (bv. "me")
 
-# --- Hyperliquid (vervangt Flash Trade als trading-venue, augustus 2026) ---
-# Flash Trade gaf herhaaldelijk on-chain problemen tijdens setup en heeft geen
-# Python-SDK (alles was zelf-gebouwde/gesignde ruwe Solana-tx's). Hyperliquid
-# heeft een officieel onderhouden Python-SDK (hyperliquid-dex/hyperliquid-python-sdk)
-# met directe order()/update_leverage()-calls en ingebouwde TP/SL-trigger-orders.
+# --- ApeX Omni (vervangt Hyperliquid als trading-venue, september 2026) ---
+# ApeX Omni (apex.exchange) is zelf de trading-venue -- geen Phantom/Hyperliquid
+# meer tussen: het geld staat rechtstreeks op ApeX Omni. Officiële Python-SDK:
+# apexomni (pip install apexomni), github.com/ApeX-Protocol/apexpro-openapi.
 #
-# BELANGRIJK: Hyperliquid draait NIET op Solana -- het gebruikt Ethereum-stijl
-# (secp256k1) wallets. Dit is dezelfde EVM-account als Phantom's ingebouwde
-# "Perps"-feature gebruikt (zelfde seed phrase als de Solana-wallet, maar een
-# apart 0x-adres) -- zelf geverifieerd via Phantom's eigen docs: "You can
-# export your perps account by exporting your Phantom wallet's private key
-# and importing it into any EVM-compatible wallet." Exporteer 'm via Phantom:
-# instellingen -> account -> Show Private Key -> netwerk "Ethereum" kiezen
-# (Ethereum/Base/Polygon/HyperEVM delen dezelfde private key per account).
-HYPERLIQUID_PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+# BELANGRIJK VERSCHIL MET HYPERLIQUID: ApeX Omni gebruikt een twee-sleutel-
+# systeem, geen kaal EVM-private-key-signing. Je EVM-key (hieronder) ondertekent
+# EENMALIG een onboarding-bericht waaruit een aparte "L2 zk-key" wordt afgeleid;
+# daarna wordt élke order dubbel gesigned (een API-key-signature + een losse
+# L2-signature). Die L2-sleutel + de vaste API-credentials worden NIET elke
+# run opnieuw afgeleid -- ze komen precies één keer uit setup_apex_account.py
+# en moeten daarna hieronder in .env staan. Zelf geverifieerd tegen ApeX
+# Omni's testnet (registratie, order plaatsen, annuleren, leverage zetten) --
+# zie setup_apex_account.py voor de eenmalige setup-stap.
+APEX_ETH_PRIVATE_KEY = os.getenv("APEX_ETH_PRIVATE_KEY", "")
 
-# Optioneel: laat leeg tenzij je met een apart API-agent-wallet signt terwijl
-# je toch tegen het hoofdaccount wilt traden (approve_agent-flow). Leeg =
-# het adres dat bij HYPERLIQUID_PRIVATE_KEY hoort.
-HYPERLIQUID_ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+# Vaste API-credentials + L2 zk-sleutels, ALLEEN te verkrijgen door eenmalig
+# setup_apex_account.py te draaien (kunnen niet opnieuw opgevraagd worden --
+# de setup print ze precies één keer).
+APEX_API_KEY = os.getenv("APEX_API_KEY", "")
+APEX_API_SECRET = os.getenv("APEX_API_SECRET", "")
+APEX_API_PASSPHRASE = os.getenv("APEX_API_PASSPHRASE", "")
+APEX_ZK_SEEDS = os.getenv("APEX_ZK_SEEDS", "")
+APEX_ZK_L2KEY = os.getenv("APEX_ZK_L2KEY", "")
 
-# "mainnet" of "testnet". Bewust op "mainnet" als default: dit gebruikt het
-# bestaande Phantom Perps-saldo, geen apart testnet-geld.
-HYPERLIQUID_ENV = os.getenv("HYPERLIQUID_ENV", "mainnet")
+# "main" of "test". Bewust op "main" als default (zelfde redenering als
+# voorheen bij Hyperliquid: dit gebruikt het bestaande ApeX Omni-saldo), maar
+# ApeX Omni heeft -- anders dan Hyperliquid -- wél een volwaardig testnet
+# (testnet.omni.apex.exchange, gratis faucet-geld). Zet hierop "test" voor je
+# eerste end-to-end-tests, los van (en bovenop) DRY_RUN.
+APEX_ENV = os.getenv("APEX_ENV", "main")
 
 # --- Safety / mode ---
 # Staat standaard op "veilig". Zet pas uit als je alles hebt getest.
 DRY_RUN = _bool("DRY_RUN", True)  # True = alles loggen, niets echt uitvoeren
 
 # Max. aantal gelijktijdig open live posities, simpele harde grens. Gecheckt
-# via Hyperliquid's eigen clearinghouseState vlak voor elke nieuwe entry (alle
+# via ApeX Omni's eigen account-positions vlak voor elke nieuwe entry (alle
 # live posities, ongeacht via welke flow ze geopend zijn) -- niet een lokale
 # telling die uit sync kan raken met wat er écht op de exchange staat.
 MAX_CONCURRENT_POSITIONS = _int("MAX_CONCURRENT_POSITIONS", 8)
@@ -78,14 +85,16 @@ MAX_CONCURRENT_POSITIONS = _int("MAX_CONCURRENT_POSITIONS", 8)
 # VERVANGT de oude MAX_RISK_USD-aanpak (vast dollarbedrag, qty = MAX_RISK_USD
 # / |entry - SL|): die was volledig onafhankelijk van leverage, waardoor een
 # lagere dan verwachte max-leverage per coin (bv. HYPE: signal vroeg 25x,
-# Hyperliquid staat maar 10x toe) evenveel qty maar 2.5x zoveel margin kostte
+# de exchange stond destijds maar 10x toe) evenveel qty maar 2.5x zoveel margin kostte
 # -- bij een klein account (~$20) at dat in de praktijk 70-80% van het totale
 # saldo op (incident 2026-08-11/12). Direct als %-van-saldo sizen voorkomt dat
 # soort verrassingen structureel, ongeacht welke leverage een coin toestaat.
 MAX_MARGIN_PCT_OF_FUNDS = _float("MAX_MARGIN_PCT_OF_FUNDS", 33.0)
 
-# Hyperliquid weigert orders onder deze notional-waarde (zelf geverifieerd
-# via hun docs).
+# Ondergrens die WIJ hanteren voor een deel-close (zie _target_close_qty):
+# ApeX Omni's eigen ondergrens is per-symbol minOrderSize (uit configV3), niet
+# een vaste dollarwaarde -- deze $10-drempel is een aparte, eigen veiligheidsmarge
+# zodat een deel-close niet zo klein wordt dat fees het grootste deel opeten.
 MIN_NOTIONAL_USD = _float("MIN_NOTIONAL_USD", 10.0)
 
 # --- v2 TP-executie (alleen voor NIEUWE signals) ---
@@ -121,26 +130,31 @@ BREAKEVEN_MOVE_AFTER_TARGET = _int("BREAKEVEN_MOVE_AFTER_TARGET", 2)
 # incident 2026-09-01 hierboven) voor fees/slippage, afgetrokken van de
 # gebankte (bruto) winst vóórdat de break-even-prijs berekend wordt. 0,15%
 # dekt ruim het volledige entry+exit fee-rondje (~0,086% gemeten op
-# Hyperliquid) plus wat marge voor slippage op de SL-fill zelf.
+# Hyperliquid, oorspronkelijk) plus wat marge voor slippage op de SL-fill
+# zelf -- ApeX Omni's taker-fee (0,05% per kant op testnet, zie
+# contractAccount.takerFeeRate) ligt in dezelfde orde grootte, maar dit
+# percentage is nog niet opnieuw empirisch gevalideerd tegen ApeX Omni's
+# eigen fee-rondje in de praktijk.
 BREAKEVEN_PNL_SAFETY_MARGIN_PCT = _float("BREAKEVEN_PNL_SAFETY_MARGIN_PCT", 0.15)
 
-# Incident 2026-08-26/28: lokale open_positions.json werd ALLEEN bijgewerkt
-# via Telegram TP/cancel-events. Een resting SL die rechtstreeks op
-# Hyperliquid triggert (buiten de bot om) of een ambigu TP/cancel-event
-# (meerdere v2-posities voor dezelfde coin) liet de state dus voor onbepaalde
-# tijd stil verouderen -- de gebruiker ontdekte drie zulke stille closes pas
-# zelf in Phantom, dagen later. executor.reconcile_positions() vergelijkt nu
-# periodiek de lokale state met de ECHTE Hyperliquid-posities en ruimt/meldt
-# elke mismatch op. Interval is een compromis tussen snel ontdekken en niet
-# onnodig vaak Hyperliquid's /info bevragen.
+# Incident 2026-08-26/28 (oorspronkelijk op Hyperliquid): lokale
+# open_positions.json werd ALLEEN bijgewerkt via Telegram TP/cancel-events.
+# Een resting SL die rechtstreeks op de exchange triggert (buiten de bot om)
+# of een ambigu TP/cancel-event (meerdere v2-posities voor dezelfde coin)
+# liet de state dus voor onbepaalde tijd stil verouderen -- de gebruiker
+# ontdekte drie zulke stille closes pas zelf in de wallet-app, dagen later.
+# executor.reconcile_positions() vergelijkt nu periodiek de lokale state met
+# de ECHTE ApeX Omni-posities en ruimt/meldt elke mismatch op. Interval is een
+# compromis tussen snel ontdekken en niet onnodig vaak ApeX Omni's
+# account-endpoint bevragen.
 POSITION_RECONCILE_INTERVAL_SECONDS = _int("POSITION_RECONCILE_INTERVAL_SECONDS", 120)
 
-# Incident 2026-09-08: de Hyperliquid-SDK gebruikt standaard GEEN timeout op
-# zijn requests-sessie (timeout=None) -- een hangende TCP-verbinding naar
-# Hyperliquid liet reconcile_positions_loop() dagenlang stilzwijgend
-# vastlopen (geen enkele log-regel meer, ook geen foutmelding), waardoor
-# state-drift niet meer werd opgevangen. Elke Info/Exchange-call krijgt nu
-# een harde timeout zodat een hangende call altijd een Exception oplevert
-# die de bestaande try/except-loops kunnen afvangen en waarna de loop gewoon
+# Incident 2026-09-08 (oorspronkelijk op Hyperliquid): een SDK zonder timeout
+# op zijn requests-sessie liet reconcile_positions_loop() dagenlang stilzwijgend
+# vastlopen op een hangende TCP-verbinding (geen enkele log-regel meer, ook
+# geen foutmelding), waardoor state-drift niet meer werd opgevangen. Elke
+# ApeX Omni-call krijgt daarom een harde requests-timeout (zie
+# executor._call) zodat een hangende call altijd een Exception oplevert die
+# de bestaande try/except-loops kunnen afvangen en waarna de loop gewoon
 # doorgaat.
-HYPERLIQUID_API_TIMEOUT_SECONDS = _float("HYPERLIQUID_API_TIMEOUT_SECONDS", 15.0)
+APEX_API_TIMEOUT_SECONDS = _float("APEX_API_TIMEOUT_SECONDS", 15.0)

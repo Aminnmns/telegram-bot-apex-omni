@@ -1,72 +1,79 @@
 """
-Voert signals uit op Hyperliquid (perps) met de EVM-private key van de
-Phantom-wallet's ingebouwde "Perps"-account (zelfde seed phrase als de
-Solana-wallet, apart 0x-adres -- zie config.HYPERLIQUID_PRIVATE_KEY).
+Voert signals uit op ApeX Omni (apex.exchange) -- een perp-DEX waar het geld
+rechtstreeks staat (geen Phantom/Hyperliquid-tussenstap meer, zie config.py's
+module-docstring voor het twee-sleutel-signing-model).
 
-OVERSTAP VAN FLASH TRADE NAAR HYPERLIQUID (2026): Flash Trade gaf herhaaldelijk
-on-chain problemen tijdens setup (vijf losse issues) en heeft geen Python-SDK
--- elke transactie moest zelf als ruwe Solana-tx gebouwd en gesigned worden.
-Hyperliquid heeft een officieel onderhouden Python-SDK
-(hyperliquid-dex/hyperliquid-python-sdk, pip install hyperliquid-python-sdk)
-met directe order()/update_leverage()-calls en ingebouwde TP/SL-trigger-orders
--- geen ruwe transacties meer nodig. check_flash_setup.py/setup_flash_account.py/
-debug_flash_tx.py blijven ongewijzigd staan als losse Flash-tooling (bv. om
-het oude $5-saldo daar ooit terug te trekken via /transaction-builder/withdraw).
+OVERSTAP VAN HYPERLIQUID NAAR APEX OMNI (2026): dezelfde onderliggende
+architectuurkeuzes als de Hyperliquid-versie (v2-exitstrategie,
+margin-based sizing, TP-ladder via Telegram-groepsberichten i.p.v. resting
+TP-trigger-orders) zijn hier bewust ONGEWIJZIGD overgenomen -- die logica is
+exchange-onafhankelijk en al meerdere keren in productie bijgeschaafd (zie de
+incident-verwijzingen in config.py). Alleen de laag die daadwerkelijk met de
+exchange praat (get_market_info, order-plaatsing, positie-/saldo-queries) is
+vervangen door de officiële `apexomni`-SDK (pip install apexomni,
+github.com/ApeX-Protocol/apexpro-openapi).
 
-BELANGRIJK: dit draait rechtstreeks tegen MAINNET (config.HYPERLIQUID_ENV),
-niet tegen testnet -- bewuste keuze om het bestaande Phantom Perps-saldo
-(~$5-6) direct te hergebruiken. DRY_RUN blijft daarom de enige veiligheidsklep
-voor deze volledig herschreven executor: laat 'm op True tot je de logs hebt
-gecontroleerd.
+BELANGRIJK -- wat zelf geverifieerd is tegen ApeX Omni's testnet (met een
+wegwerp-testaccount, geen echt geld) vóór deze code werd geschreven:
+account-registratie (zie setup_apex_account.py), order plaatsen (MARKET en
+STOP_MARKET), order-status opvragen, annuleren, leverage/margin-rate zetten,
+market-config/ticker/worst-price/account-balance-velden, EN de exacte
+foutmelding voor "reduce-only op een positie die niet (meer) bestaat"
+(`ORDER_IS_REDUCE_ONLY_CANNOT_OPEN_POSITION` -- zie _is_position_already_closed_error).
+NIET rechtstreeks bevestigd tegen een écht gevulde/live positie (het
+testaccount had geen saldo): het exacte veldenschema van get_account_v3()
+["positions"] (zie _parse_live_positions) en de terminale status-string van
+een volledig gevulde MARKET-order (zie _await_order_fill, die daarom
+voornamelijk op het NUMERIEKE gevulde-qty-veld vertrouwt i.p.v. op één
+verwachte status-tekst). Verifieer deze twee expliciet tijdens je eigen
+testnet-tests (APEX_ENV=test) voor je live gaat.
+
+BELANGRIJK: dit draait rechtstreeks tegen MAIN (config.APEX_ENV), niet tegen
+test -- bewuste keuze om het bestaande ApeX Omni-saldo direct te hergebruiken.
+DRY_RUN blijft daarom de eerste veiligheidsklep, en APEX_ENV=test is er
+BOVENOP een tweede, onafhankelijke laag (die Hyperliquid nooit had) om de
+hele pipeline eerst op nepgeld te verifiëren.
 
 Architectuur:
-- Markets/coins worden geïdentificeerd met hun symbol-string (bv. "TAO"),
-  live opgevraagd via info.meta_and_asset_ctxs() i.p.v. een lokale lijst die
-  kan verouderen (zelfde aanpak als voorheen bij Flash).
-- De Hyperliquid Python-SDK (Exchange/Info) is SYNCHROON (gebruikt de
-  `requests`-library, geen async). Alle calls lopen daarom via
-  asyncio.to_thread(...) zodat ze de Telegram-event-loop niet blokkeren.
-- Entry = market_open() (agressieve IOC-limit-order, SDK regelt zelf de
-  prijsafronding).
+- Markets worden geïdentificeerd met hun ApeX Omni-symbol ("BTC-USDT"),
+  live opgevraagd via configs_v3()/ticker_v3() i.p.v. een lokale lijst die
+  kan verouderen (zelfde aanpak als voorheen).
+- De apexomni-SDK is SYNCHROON (gebruikt de `requests`-library, geen async).
+  Alle calls lopen daarom via asyncio.to_thread(...) zodat ze de
+  Telegram-event-loop niet blokkeren (zie _call()).
+- Entry = MARKET-order met `price` = get_worst_price_v3()'s worstPrice
+  (ApeX Omni's eigen max-slippage-mechanisme voor market-orders).
 
-EXIT-STRATEGIE (v2, sinds 2026-08-11, geldt voor alle posities): qty wordt
-direct afgeleid van config.MAX_MARGIN_PCT_OF_FUNDS% van het beschikbare
-saldo (i.p.v. de oude MAX_RISK_USD-aanpak, zie config.MAX_MARGIN_PCT_OF_FUNDS's
-docstring voor waarom -- kort samengevat: een vast dollarrisico onafhankelijk
-van leverage kon bij een lage toegestane leverage per coin een veel te groot
-deel van een klein account aan margin opeisen). Bij entry wordt ALLEEN een SL
-geplaatst (volle qty, onafhankelijk actief op Hyperliquid tussen entry en het
-eerste TP-bericht) -- geen TP-trigger-order, want die bleek onbetrouwbaar te
-detecteren of een fill echt was (zie het PENGU-incident van 2026-08-11: een
-TP1-order verdween uit frontend_open_orders zonder een bijbehorende fill,
-waardoor de oude break-even-SL een verkeerde qty kreeg en een deel van de
-positie onbeschermd bleef). Sluiten gebeurt expliciet op basis van de groep's
-eigen "Take-Profit target N ✅"-berichten (signal_parser.parse_tp_event): een
-5-staps ladder over de ORIGINELE qty (target 1 t/m 4 elk hun eigen
-TP_EVENT_TARGETN_CLOSE_PCT%, target 5 altijd de volledige rest), waarbij
-target 1 ook de SL naar break-even verplaatst. Elke stap is cumulatief
-berekend (hoeveel had er tot-en-met deze target dicht moeten zijn, minus wat
-er al dicht is) i.p.v. een onafhankelijk percentage per stap -- zo schuift een
-deel-close die onder MIN_NOTIONAL_USD zou vallen (klein account) automatisch
-door naar de eerstvolgende target die wel boven de grens uitkomt, met target
-5 als uiteindelijke vangnet-fallback, zonder aparte "carry"-state nodig te
-hebben. Elke state-entry heeft een "version":
-"v2"-veld -- overblijfsel van een eerdere, inmiddels volledig uitgefaseerde
-legacy-strategie (trigger-order-polling); nu altijd "v2", maar de check bleef
-staan als goedkope garde tegen een onverwacht ander state-schema.
+EXIT-STRATEGIE (v2, ONGEWIJZIGD overgenomen van de Hyperliquid-versie, geldt
+voor alle posities): qty wordt direct afgeleid van
+config.MAX_MARGIN_PCT_OF_FUNDS% van het beschikbare saldo (zie
+_calc_margin_based_qty). Bij entry wordt ALLEEN een SL geplaatst (volle qty,
+als STOP_MARKET reduce-only trigger-order, onafhankelijk actief op ApeX Omni
+tussen entry en het eerste TP-bericht) -- geen TP-trigger-order. Sluiten
+gebeurt expliciet op basis van de groep's eigen "Take-Profit target N
+✅"-berichten (signal_parser.parse_tp_event): een 5-staps ladder over de
+ORIGINELE qty, elke stap een DIRECTE reduce-only MARKET-close zodra het
+bericht binnenkomt (geen resting TP-trigger-orders -- zie de
+Hyperliquid-versie's moduledocstring voor de oorspronkelijke reden: een
+TP-trigger-order bleek onbetrouwbaar te detecteren of een fill echt was).
+Target 1 verplaatst ook de SL naar een dynamisch berekende break-even (zie
+config.BREAKEVEN_MOVE_AFTER_TARGET/BREAKEVEN_PNL_SAFETY_MARGIN_PCT).
 """
 import asyncio
+import decimal
 import json
 import logging
-import math
 import os
 import time
 from typing import Optional
 
-from eth_account import Account
-from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
-from hyperliquid.utils import constants
+from apexomni.constants import (
+    APEX_OMNI_HTTP_MAIN,
+    APEX_OMNI_HTTP_TEST,
+    NETWORKID_MAIN,
+    NETWORKID_TEST,
+)
+from apexomni.http_private_sign import HttpPrivateSign
 
 import config
 import db
@@ -81,9 +88,9 @@ notify_callback = None
 
 # Overrideable via env var zodat test-scripts NOOIT het gedeelde, echte
 # state-bestand van de live service kunnen raken -- dat gebeurde eerder
-# (2026-08-10) toen een test zonder deze isolatie een positie-entry in het
-# gedeelde bestand achterliet, die de live service vervolgens oppikte en er
-# (met de ECHTE exchange) actie op ondernam.
+# (2026-08-10, oorspronkelijk op Hyperliquid) toen een test zonder deze
+# isolatie een positie-entry in het gedeelde bestand achterliet, die de live
+# service vervolgens oppikte en er (met de ECHTE exchange) actie op ondernam.
 STATE_FILE = os.getenv("STATE_FILE_PATH") or os.path.join(os.path.dirname(__file__), "open_positions.json")
 _state_lock = asyncio.Lock()
 # Zie de duplicaat-guard in place_entry_order(): een echt duplicaat-signal
@@ -93,240 +100,231 @@ DUPLICATE_POSITION_WINDOW_SECONDS = 60
 # State-keys waarvoor handle_cancel_event() op dit moment een SL-cancel/close
 # aan het uitvoeren is -- voorkomt dat een (bijna) gelijktijdig binnenkomend
 # duplicaat-cancelbericht dezelfde positie nogmaals probeert te sluiten
-# voordat de eerste klaar is en de state-pop heeft gedaan (zie
-# handle_cancel_event() voor het geobserveerde incident).
+# voordat de eerste klaar is en de state-pop heeft gedaan.
 _cancel_in_progress: set[str] = set()
 
-# Hyperliquid-regel (zelf geverifieerd, geen aanname): prijzen mogen max. 5
-# significante cijfers hebben, en max. (6 - szDecimals) decimalen voor perps.
-PERP_MAX_DECIMALS = 6
-
-# Marge tussen triggerPx en de limit_px van een reduce-only trigger-order
-# (isMarket=True), zodat de resulterende IOC-order ook echt kan vullen als de
-# markt net over de trigger heen schiet.
+# Marge tussen triggerPrice en de limit-`price` van een reduce-only
+# STOP_MARKET-order, zodat de order ook echt kan vullen als de markt net over
+# de trigger heen schiet (zelfde reden als voorheen bij Hyperliquid).
 TRIGGER_LIMIT_BUFFER_PCT = 0.03
 
-_API_URL = constants.MAINNET_API_URL if config.HYPERLIQUID_ENV == "mainnet" else constants.TESTNET_API_URL
+# Hoeveel keer/hoe lang gepolld wordt op get_order_v3() na het plaatsen van
+# een MARKET-order, om de fill te bevestigen (zie _await_order_fill). ApeX
+# Omni's create_order_v3-response bevat -- anders dan Hyperliquid's
+# synchrone market_open()-response -- geen directe fill-bevestiging.
+ORDER_FILL_POLL_ATTEMPTS = 10
+ORDER_FILL_POLL_INTERVAL_SECONDS = 0.5
 
-_wallet = None
-_exchange = None
-_info = None
+_ORDER_TERMINAL_FAILURE_STATUSES = {"CANCELED", "EXPIRED", "REJECTED"}
 
-
-def _get_wallet():
-    global _wallet
-    if _wallet is None:
-        _wallet = Account.from_key(config.HYPERLIQUID_PRIVATE_KEY)
-    return _wallet
-
-
-def get_owner_address() -> str:
-    return config.HYPERLIQUID_ACCOUNT_ADDRESS or _get_wallet().address
+_client = None
+_client_lock = asyncio.Lock()
 
 
-def _get_exchange() -> Exchange:
-    global _exchange
-    if _exchange is None:
-        _exchange = Exchange(
-            _get_wallet(), _API_URL, account_address=config.HYPERLIQUID_ACCOUNT_ADDRESS or None,
-            timeout=config.HYPERLIQUID_API_TIMEOUT_SECONDS,
-        )
-    return _exchange
-
-
-def _get_info() -> Info:
-    global _info
-    if _info is None:
-        _info = Info(_API_URL, skip_ws=True, timeout=config.HYPERLIQUID_API_TIMEOUT_SECONDS)
-    return _info
+def _apex_endpoint():
+    if config.APEX_ENV == "main":
+        return APEX_OMNI_HTTP_MAIN, NETWORKID_MAIN
+    return APEX_OMNI_HTTP_TEST, NETWORKID_TEST
 
 
 async def _call(fn, *args, **kwargs):
-    """De Hyperliquid-SDK is synchroon (requests-library) -- via to_thread()
+    """De apexomni-SDK is synchroon (requests-library) -- via to_thread()
     zodat een trage/hangende HTTP-call de Telegram-listener niet blokkeert."""
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-def _round_px(px: float, sz_decimals: int) -> float:
-    """5 significante cijfers, max (6 - szDecimals) decimalen -- Hyperliquid's
-    eigen regel (zelf geverifieerd via hun docs + de SDK's _slippage_price)."""
-    sig_figs = float(f"{px:.5g}")
-    return round(sig_figs, max(0, PERP_MAX_DECIMALS - sz_decimals))
+async def _get_client() -> HttpPrivateSign:
+    """Eén gecachete, ingelogde ApeX Omni-client voor de hele module (zelfde
+    singleton-patroon als voorheen _get_exchange()/_get_info()). De
+    dual-key-signing-context (zk_seeds/zk_l2Key/api_key_credentials) komt uit
+    config.py -- ALLEMAAL uit de eenmalige setup_apex_account.py-run, nooit
+    hier opnieuw afgeleid."""
+    global _client
+    if _client is not None:
+        return _client
+    async with _client_lock:
+        if _client is not None:
+            return _client
+        endpoint, network_id = _apex_endpoint()
+        client = HttpPrivateSign(
+            endpoint,
+            network_id=network_id,
+            eth_private_key=config.APEX_ETH_PRIVATE_KEY,
+            zk_seeds=config.APEX_ZK_SEEDS,
+            zk_l2Key=config.APEX_ZK_L2KEY,
+            api_key_credentials={
+                "key": config.APEX_API_KEY,
+                "secret": config.APEX_API_SECRET,
+                "passphrase": config.APEX_API_PASSPHRASE,
+            },
+            request_timeout=config.APEX_API_TIMEOUT_SECONDS,
+        )
+        await _call(client.configs_v3)
+        await _call(client.get_account_v3)
+        _client = client
+        return _client
 
 
-def _round_sz(sz: float, sz_decimals: int) -> float:
-    return round(sz, sz_decimals)
+async def get_owner_address(client=None) -> str:
+    client = client or await _get_client()
+    return client.default_address
 
 
-async def get_market_info(symbol: str, info=None) -> dict:
+def _apex_symbol(base_symbol: str) -> str:
+    return f"{base_symbol.upper()}-USDT"
+
+
+def _round_down_to_step(value: float, step) -> float:
+    """Naar beneden afgerond op een veelvoud van `step` (tickSize voor
+    prijzen, stepSize voor qty). ApeX Omni's eigen create_order_v3 weigert
+    een prijs die geen exact veelvoud van tickSize is (zelf geverifieerd:
+    'the price must Multiple of tickSize') -- en net als bij Hyperliquid's
+    sz_decimals-afronding willen we bij qty altijd naar BENEDEN afronden
+    zodat de werkelijke margin na afronding nooit boven de
+    MAX_MARGIN_PCT_OF_FUNDS-cap uitkomt."""
+    step_dec = decimal.Decimal(str(step))
+    if step_dec <= 0:
+        return value
+    # Eerst op 8 decimalen afronden (ruim onder elke realistische tick/
+    # stepSize) voor we floor'en: `value` is vaak zelf al het resultaat van
+    # eerdere float-op-/aftrekkingen (bv. qty - remaining_qty in
+    # _target_close_qty), die IEEE754-restruis kunnen achterlaten (29.94 ->
+    # 29.939999999999998). Zonder deze stap floort zo'n "eigenlijk exacte"
+    # waarde een hele step te laag, wat over een 4-staps TP-ladder een paar
+    # cent bookkeeping-drift veroorzaakte (ontdekt tijdens het overzetten van
+    # test_exit_strategy.py naar ApeX Omni, 2026-09).
+    val_dec = decimal.Decimal(str(value)).quantize(decimal.Decimal("1e-8"), rounding=decimal.ROUND_HALF_UP)
+    steps = (val_dec / step_dec).to_integral_value(rounding=decimal.ROUND_DOWN)
+    return float(steps * step_dec)
+
+
+def _round_px(px: float, tick_size) -> float:
+    return _round_down_to_step(px, tick_size)
+
+
+def _round_sz(sz: float, step_size) -> float:
+    return _round_down_to_step(sz, step_size)
+
+
+async def get_market_info(symbol: str, client=None) -> dict:
     """
-    Haalt max leverage, szDecimals en de actuele markprijs live op uit
-    /info (metaAndAssetCtxs) i.p.v. een handmatige lijst te vertrouwen --
-    zelfde redenering als voorheen bij Flash Trade. Raiset ValueError als de
-    coin niet (meer) bestaat op Hyperliquid, zodat de trade wordt
-    overgeslagen i.p.v. blind te traden.
-
-    `info` is optioneel injecteerbaar (i.p.v. via de module-singleton
-    _get_info()) zodat tests een fake object kunnen doorgeven zonder op
-    monkeypatching van module-globals te hoeven vertrouwen.
+    Haalt max leverage, tick/step-size en de actuele markprijs live op via
+    configs_v3()/ticker_v3() i.p.v. een handmatige lijst te vertrouwen.
+    Raiset ValueError als de coin niet (meer) bestaat op ApeX Omni, zodat de
+    trade wordt overgeslagen i.p.v. blind te traden.
     """
-    info = info or _get_info()
-    meta, ctxs = await _call(info.meta_and_asset_ctxs)
-    for idx, asset in enumerate(meta["universe"]):
-        if asset["name"].upper() == symbol.upper() and not asset.get("isDelisted"):
-            return {
-                "max_leverage": int(asset["maxLeverage"]),
-                "sz_decimals": int(asset["szDecimals"]),
-                "mark_px": float(ctxs[idx]["markPx"]),
-            }
+    client = client or await _get_client()
+    apex_symbol = _apex_symbol(symbol)
 
-    raise ValueError(
-        f"Geen Hyperliquid market gevonden voor {symbol}. Check handmatig op "
-        f"https://app.hyperliquid.xyz of deze coin daar (nog) verhandelbaar is."
-    )
+    perp_contracts = ((client.configV3 or {}).get("contractConfig") or {}).get("perpetualContract") or []
+    symbol_data = next((c for c in perp_contracts if c.get("symbol") == apex_symbol), None)
+    if symbol_data is None:
+        raise ValueError(
+            f"Geen ApeX Omni market gevonden voor {apex_symbol}. Check handmatig op "
+            f"https://omni.apex.exchange of deze coin daar (nog) verhandelbaar is."
+        )
 
+    ticker_resp = await _call(client.ticker_v3, symbol=apex_symbol)
+    ticker_list = _check_order_status(ticker_resp, "ticker opvragen")
+    if not ticker_list:
+        raise ValueError(f"Geen ticker-data voor {apex_symbol} op ApeX Omni.")
 
-async def count_open_positions(info=None, owner=None) -> int:
-    """
-    Telt open live posities via Hyperliquid's EIGEN clearinghouseState --
-    bewust niet via de lokale open_positions.json, want die kan uit sync
-    raken met wat er werkelijk op de exchange staat (zie het incident van
-    2026-08-10: een lokaal state-bestand met foutieve entries leidde al
-    eens tot verkeerd gedrag). `info`/`owner` injecteerbaar voor tests.
-    """
-    info = info or _get_info()
-    owner = owner or get_owner_address()
-    state = await _call(info.user_state, owner)
-    return len(state.get("assetPositions", []))
+    return {
+        "apex_symbol": apex_symbol,
+        "max_leverage": int(float(symbol_data.get("displayMaxLeverage", 1))),
+        "tick_size": symbol_data.get("tickSize"),
+        "step_size": symbol_data.get("stepSize"),
+        "mark_px": float(ticker_list[0]["markPrice"]),
+    }
 
 
-def _parse_live_positions(perp_state: dict) -> dict:
-    """coin -> {"qty": abs(szi), "is_buy": szi > 0, "entry_price": entryPx}
-    voor elke coin met een open positie in deze clearinghouseState-snapshot.
-    Gedeeld door _get_live_position() en reconcile_positions() zodat er maar
-    één plek is die assetPositions/szi-teken interpreteert."""
+def _parse_live_positions(positions) -> dict:
+    """coin -> {"qty": abs(size), "is_buy": ..., "entry_price": ...} voor
+    elke coin met een open positie in deze get_account_v3()-snapshot.
+
+    LET OP (zie moduledocstring): dit veldenschema (symbol/side/size/
+    entryPrice) volgt ApeX Omni's consistente camelCase-conventie die overal
+    elders in de v3-API zelf geverifieerd is (orders, ticker, balance), maar
+    is NIET rechtstreeks bevestigd tegen een écht gevulde positie. Verifieer
+    dit tegen een kleine testnet-positie voor je live gaat."""
     result = {}
-    for ap in perp_state.get("assetPositions", []):
-        p = ap.get("position", {})
-        coin = p.get("coin")
-        szi = float(p.get("szi", 0) or 0)
-        if coin and szi != 0:
-            result[coin] = {"qty": abs(szi), "is_buy": szi > 0, "entry_price": float(p.get("entryPx", 0) or 0)}
+    for p in positions or []:
+        symbol = str(p.get("symbol", ""))
+        base = symbol.split("-")[0] if "-" in symbol else symbol
+        size = float(p.get("size", 0) or 0)
+        if not base or size == 0:
+            continue
+        side = str(p.get("side", "")).upper()
+        result[base] = {
+            "qty": abs(size),
+            "is_buy": (side == "BUY") if side else size > 0,
+            "entry_price": float(p.get("entryPrice", 0) or 0),
+        }
     return result
 
 
-async def _get_live_position(base_symbol: str, owner: str, info=None) -> Optional[dict]:
-    """Haalt de ECHTE huidige netto positie voor base_symbol op bij
-    Hyperliquid zelf (zie _parse_live_positions), of None als er geen open
-    positie is. Gebruikt bij een same-side re-entry (zie place_entry_order)
-    om de nieuwe, samengevoegde qty/entry-prijs autoritatief te bepalen
-    i.p.v. zelf op te tellen/te wegen -- Hyperliquid kent maar één netto
-    positie per coin (geen hedge-mode): een nieuwe order in dezelfde
-    richting wordt door de exchange zelf al samengevoegd met de bestaande
-    positie (inclusief eigen avgPx-berekening, die met funding/afronding kan
-    afwijken van een simpele lokale herberekening)."""
-    info = info or _get_info()
-    state = await _call(info.user_state, owner)
-    return _parse_live_positions(state).get(base_symbol)
+async def _fetch_live_positions(client=None) -> dict:
+    client = client or await _get_client()
+    resp = await _call(client.get_account_v3)
+    data = _check_order_status(resp, "posities opvragen")
+    return _parse_live_positions(data.get("positions"))
 
 
-async def _fetch_funds_state(info=None, owner=None):
-    """Eén gedeelde fetch van perps- en spot-state, zodat get_withdrawable()
-    en get_total_equity() niet allebei apart user_state()/spot_user_state()
-    hoeven aan te roepen -- voorkomt dubbele API-calls én een mogelijk
-    inconsistente snapshot (het ene getal net iets ouder dan het andere) als
-    beide na elkaar in dezelfde trade nodig zijn (zie place_entry_order)."""
-    info = info or _get_info()
-    owner = owner or get_owner_address()
-    perp_state = await _call(info.user_state, owner)
-    spot_state = await _call(info.spot_user_state, owner)
-    return perp_state, spot_state
+async def count_open_positions(client=None) -> int:
+    """Telt open live posities via ApeX Omni's EIGEN account-endpoint --
+    bewust niet via de lokale open_positions.json, want die kan uit sync
+    raken met wat er werkelijk op de exchange staat."""
+    return len(await _fetch_live_positions(client))
 
 
-def _withdrawable_from_state(perp_state: dict, spot_state: dict) -> float:
-    """Beschikbare marge voor een NIEUWE positie: perps-`withdrawable` +
-    vrije spot-USDC.
-
-    Zelf empirisch geverifieerd (2026-08-11, geen aanname): clearinghouseState
-    ("perps") toonde withdrawable=$0.00, terwijl er $17.67 vrije spot-USDC
-    stond (spot_user_state's tokenToAvailableAfterMaintenance). Een kleine,
-    niet-vulbare test-order (ALO, ver van de markt, meteen geannuleerd) die
-    meer marge vereiste dan de $0.00 perps-withdrawable werd door Hyperliquid
-    gewoon GEACCEPTEERD -- de matching-engine trekt bij het OPENEN van een
-    nieuwe positie kennelijk automatisch op vrije spot-USDC, ook al rapporteert
-    clearinghouseState.withdrawable dat niet mee (dat veld lijkt specifiek
-    "wat kan ik nu naar mijn externe wallet overmaken" te betekenen, niet
-    "hoeveel marge kan ik gebruiken om een nieuwe positie te openen"). Alleen
-    naar clearinghouseState.withdrawable kijken is dus te conservatief en
-    blokkeert onterecht v2-trades die Hyperliquid wel zou accepteren."""
-    perp_withdrawable = float(perp_state.get("withdrawable", 0))
-
-    usdc_token_id = None
-    for bal in spot_state.get("balances", []):
-        if bal.get("coin") == "USDC":
-            usdc_token_id = bal.get("token")
-            break
-
-    spot_free_usdc = 0.0
-    if usdc_token_id is not None:
-        for token_id, available in spot_state.get("tokenToAvailableAfterMaintenance", []):
-            if token_id == usdc_token_id:
-                spot_free_usdc = float(available)
-                break
-
-    return perp_withdrawable + spot_free_usdc
+async def _get_live_position(base_symbol: str, client=None) -> Optional[dict]:
+    """Haalt de ECHTE huidige netto positie voor base_symbol op bij ApeX
+    Omni zelf, of None als er geen open positie is. Gebruikt bij een
+    same-side re-entry om de nieuwe, samengevoegde qty/entry-prijs
+    autoritatief te bepalen i.p.v. zelf op te tellen/te wegen."""
+    return (await _fetch_live_positions(client)).get(base_symbol)
 
 
-def _total_equity_from_state(perp_state: dict, spot_state: dict) -> float:
-    """Totale accountwaarde als basis voor MAX_MARGIN_PCT_OF_FUNDS%: perps
-    accountValue (incl. marge die al in andere posities vastzit) + totale
-    spot-USDC (incl. wat er 'on hold' staat).
-
-    Bewust ANDERS dan _withdrawable_from_state() (dat alleen NU vrij
-    beschikbare marge teruggeeft): als de qty-berekening op withdrawable zou
-    blijven steunen, wordt elke volgende trade binnen dezelfde cyclus van
-    meerdere gelijktijdig openende posities kleiner, omdat withdrawable
-    slinkt naarmate er meer marge vastgezet wordt. Door op de TOTALE
-    accountwaarde te mikken blijft het bedrag per trade constant; of een
-    trade daadwerkelijk past wordt apart gecheckt tegen
-    _withdrawable_from_state() (zie place_entry_order)."""
-    perp_account_value = float(perp_state.get("marginSummary", {}).get("accountValue", 0))
-
-    spot_total_usdc = 0.0
-    for bal in spot_state.get("balances", []):
-        if bal.get("coin") == "USDC":
-            spot_total_usdc = float(bal.get("total", 0))
-            break
-
-    return perp_account_value + spot_total_usdc
+async def _fetch_account_balance(client=None) -> dict:
+    client = client or await _get_client()
+    resp = await _call(client.get_account_balance_v3)
+    return _check_order_status(resp, "account-balance opvragen")
 
 
-async def get_withdrawable(info=None, owner=None) -> float:
-    """Publieke wrapper rond _withdrawable_from_state() voor aanroepers die
-    alléén deze waarde nodig hebben (bv. tests, dashboard). `info`/`owner`
-    injecteerbaar voor tests, zelfde reden als count_open_positions()."""
-    perp_state, spot_state = await _fetch_funds_state(info, owner)
-    return _withdrawable_from_state(perp_state, spot_state)
+def _withdrawable_from_balance(balance: dict) -> float:
+    """Beschikbare marge voor een NIEUWE positie. ApeX Omni geeft dit --
+    anders dan Hyperliquid, waar perps- en spot-saldo apart opgevraagd en
+    opgeteld moesten worden -- als één rechtstreeks veld terug (zelf
+    geverifieerd)."""
+    return float(balance.get("availableBalance", 0) or 0)
 
 
-async def get_total_equity(info=None, owner=None) -> float:
-    """Publieke wrapper rond _total_equity_from_state(). `info`/`owner`
-    injecteerbaar voor tests, zelfde reden als count_open_positions()."""
-    perp_state, spot_state = await _fetch_funds_state(info, owner)
-    return _total_equity_from_state(perp_state, spot_state)
+def _total_equity_from_balance(balance: dict) -> float:
+    """Totale accountwaarde als basis voor MAX_MARGIN_PCT_OF_FUNDS% (zelfde
+    reden als voorheen bij Hyperliquid: hiermee blijft het bedrag per trade
+    constant binnen een cyclus van meerdere gelijktijdig openende posities,
+    i.p.v. steeds kleiner te worden als _withdrawable_from_balance() zou
+    slinken naarmate er meer marge vastgezet wordt)."""
+    return float(balance.get("totalEquityValue", 0) or 0)
 
 
-def _calc_margin_based_qty(entry_px: float, leverage: int, available_funds: float, sz_decimals: int) -> float:
+async def get_withdrawable(client=None) -> float:
+    return _withdrawable_from_balance(await _fetch_account_balance(client))
+
+
+async def get_total_equity(client=None) -> float:
+    return _total_equity_from_balance(await _fetch_account_balance(client))
+
+
+def _calc_margin_based_qty(entry_px: float, leverage: int, available_funds: float, step_size) -> float:
     """qty zo dat de benodigde margin exact MAX_MARGIN_PCT_OF_FUNDS% van
     available_funds is: margin = available_funds * pct/100, notional =
-    margin * leverage, qty = notional / entry_px. Naar BENEDEN afgerond
-    (niet _round_sz's normale afronding) zodat de werkelijke margin na
-    afronding nooit boven de cap uitkomt -- normaal afronden kan naar boven
-    afronden en daarmee de cap net overschrijden."""
+    margin * leverage, qty = notional / entry_px. Naar BENEDEN afgerond op
+    stepSize zodat de werkelijke margin na afronding nooit boven de cap
+    uitkomt."""
     margin_to_use = available_funds * (config.MAX_MARGIN_PCT_OF_FUNDS / 100)
     raw_qty = (margin_to_use * leverage) / entry_px
-    factor = 10 ** sz_decimals
-    return math.floor(raw_qty * factor) / factor
+    return _round_down_to_step(raw_qty, step_size)
 
 
 async def _notify(message: str):
@@ -350,79 +348,201 @@ def _save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-_POSITION_ALREADY_CLOSED_MARKERS = (
-    "Reduce only order would increase position",
-    "Order was never placed, already canceled, or filled",
+def _check_order_status(resp: dict, action: str):
+    """ApeX Omni geeft een JSON-envelope terug: een geslaagde call heeft géén
+    (of een lege/0-)'code'-veld, een afgekeurde call heeft 'code' (meestal
+    niet-nul) + 'msg' + meestal 'key' (zelf geverifieerd tegen hun testnet,
+    zowel voor business-fouten als malformed-request-fouten). Geeft
+    resp['data'] terug bij succes (kan een dict OF een list zijn, afhankelijk
+    van het endpoint -- bv. ticker_v3 geeft een list terug)."""
+    code = resp.get("code")
+    if code:
+        key = resp.get("key", code)
+        raise RuntimeError(f"ApeX Omni wees {action} af: {resp.get('msg')} ({key})")
+    return resp.get("data", {})
+
+
+# Deze exacte key is zelf geverifieerd tegen ApeX Omni's testnet: een
+# reduce-only order op een symbol zonder (of met te kleine) open positie
+# geeft precies deze 'key' terug -- de ApeX Omni-tegenhanger van Hyperliquid's
+# "Reduce only order would increase position". Dit is het enige scenario dat
+# hier bevestigd is; andere "positie bleek al gesloten"-varianten (bv. een
+# dubbele SL-cancel) komen als een aparte apexomni.exceptions.FailedRequestError
+# binnen (HTTP 409) i.p.v. een JSON-foutrespons, en worden daarom niet via
+# deze functie afgehandeld -- de aanroepende cancel-calls slikken sowieso
+# alle Exceptions al (zie bv. place_entry_order's re-entry-SL-cancel).
+_POSITION_ALREADY_CLOSED_KEYS = (
+    "ORDER_IS_REDUCE_ONLY_CANNOT_OPEN_POSITION",
 )
 
 
 def _is_position_already_closed_error(exc: Exception) -> bool:
-    """True als deze Hyperliquid-foutmelding erop wijst dat de positie (of de
-    bijbehorende SL-order) al buiten de bot om gesloten/gecanceld is -- bv.
-    doordat een eerder geplaatste break-even-SL intussen is getriggerd.
-    Geobserveerd 2026-08-25: PENGU/BTC/HYPE crashten hierop bij latere
-    TP-events omdat de lokale state (remaining_qty > 0) niet meer klopte met
-    de werkelijke, inmiddels lege positie op de exchange."""
-    return any(marker in str(exc) for marker in _POSITION_ALREADY_CLOSED_MARKERS)
+    """True als deze ApeX Omni-foutmelding erop wijst dat de positie (of de
+    bijbehorende reduce-only close) al buiten de bot om gesloten is -- bv.
+    doordat een eerder geplaatste break-even-SL intussen is getriggerd (zelfde
+    incident-klasse als PENGU/BTC/HYPE, 2026-08-25, oorspronkelijk op
+    Hyperliquid)."""
+    return any(marker in str(exc) for marker in _POSITION_ALREADY_CLOSED_KEYS)
 
 
-def _check_order_status(resp: dict, action: str):
-    """Hyperliquid geeft HTTP 200 terug voor zowel geslaagde als afgekeurde
-    orders -- de echte fout zit in de JSON zelf (status != 'ok', of een
-    status-item van het type 'error')."""
-    if resp.get("status") != "ok":
-        raise RuntimeError(f"Hyperliquid wees {action} af: {resp}")
-    statuses = resp.get("response", {}).get("data", {}).get("statuses", [])
-    for status in statuses:
-        if isinstance(status, dict) and "error" in status:
-            raise RuntimeError(f"Hyperliquid order-fout bij {action}: {status['error']}")
-    return statuses
+async def _await_order_fill(client, order_id: str, expected_size: float) -> dict:
+    """Pollt get_order_v3() tot de order een terminale staat heeft. ApeX
+    Omni's create_order_v3-response bevat -- anders dan Hyperliquid's
+    synchrone market_open()-response -- geen directe fill-bevestiging.
+    Vertrouwt vooral op het NUMERIEKE gevulde-qty-veld (cumSuccessFillSize)
+    t.o.v. de gevraagde qty i.p.v. op één verwachte status-tekst, omdat de
+    exacte status-string van een volledig gevulde MARKET-order niet
+    rechtstreeks bevestigd is (zie moduledocstring) -- wél bevestigd:
+    CANCELED/EXPIRED/REJECTED als duidelijke terminale mislukkingen."""
+    last = None
+    for _ in range(ORDER_FILL_POLL_ATTEMPTS):
+        resp = await _call(client.get_order_v3, id=order_id)
+        data = _check_order_status(resp, "order-status opvragen")
+        last = data
+        status = str(data.get("status", "")).upper()
+        filled_size = float(data.get("cumSuccessFillSize") or data.get("cumMatchFillSize") or 0)
+        if status in _ORDER_TERMINAL_FAILURE_STATUSES:
+            raise RuntimeError(f"Order {order_id} werd niet gevuld (status={status}): {data}")
+        if filled_size > 0 and (status == "FILLED" or filled_size >= expected_size * 0.999):
+            return data
+        await asyncio.sleep(ORDER_FILL_POLL_INTERVAL_SECONDS)
+    raise RuntimeError(
+        f"Order {order_id} niet binnen "
+        f"{ORDER_FILL_POLL_ATTEMPTS * ORDER_FILL_POLL_INTERVAL_SECONDS:.0f}s bevestigd als gevuld: {last}"
+    )
 
 
-async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None, info=None):
+async def _place_market_order(
+    client, apex_symbol: str, is_buy: bool, qty: float, reduce_only: bool,
+) -> tuple[float, float, str]:
+    """Plaatst een MARKET-order (entry of reduce-only close) en wacht op
+    bevestigde fill. `price` = get_worst_price_v3()'s worstPrice -- ApeX
+    Omni's eigen max-slippage-mechanisme voor market-orders (zelf
+    geverifieerd), analoog aan Hyperliquid's agressieve IOC-limit-aanpak.
+    Retourneert (filled_qty, avg_price, order_id)."""
+    side = "BUY" if is_buy else "SELL"
+    price_resp = await _call(client.get_worst_price_v3, symbol=apex_symbol, side=side, size=str(qty))
+    price_data = _check_order_status(price_resp, "worst-price opvragen")
+    worst_price = price_data["worstPrice"]
+
+    order_resp = await _call(
+        client.create_order_v3, symbol=apex_symbol, side=side, type="MARKET",
+        size=str(qty), price=str(worst_price), reduceOnly=reduce_only,
+    )
+    order_data = _check_order_status(order_resp, "market-order plaatsen")
+    order_id = order_data.get("id")
+    if order_id is None:
+        raise RuntimeError(f"Geen order-id in ApeX Omni-response: {order_data}")
+
+    filled = await _await_order_fill(client, order_id, expected_size=qty)
+    filled_qty = float(filled.get("cumSuccessFillSize") or filled.get("cumMatchFillSize") or qty)
+    avg_px = float(filled.get("averagePrice") or worst_price)
+    return filled_qty, avg_px, order_id
+
+
+async def _place_stop_order(
+    client, apex_symbol: str, exit_is_buy: bool, qty: float, trigger_price: float, limit_price: float,
+) -> Optional[str]:
+    """Plaatst een STOP_MARKET reduce-only trigger-order (de SL) -- ApeX
+    Omni's tegenhanger van Hyperliquid's `order(..., trigger={isMarket:True,
+    tpsl:'sl'})`. Geeft de order-id terug (voor latere annulering), of None
+    als die niet in de response zat."""
+    side = "BUY" if exit_is_buy else "SELL"
+    resp = await _call(
+        client.create_order_v3, symbol=apex_symbol, side=side, type="STOP_MARKET",
+        size=str(qty), price=str(limit_price), triggerPrice=str(trigger_price),
+        triggerPriceType="INDEX", reduceOnly=True, isPositionTpsl=True,
+    )
+    data = _check_order_status(resp, "stop-loss plaatsen")
+    return data.get("id")
+
+
+async def _cancel_order(client, order_id: str, action: str):
+    resp = await _call(client.delete_order_v3, id=order_id)
+    _check_order_status(resp, action)
+
+
+async def _market_close_reduce_only(
+    base_symbol: str, exit_is_buy: bool, sz: float, client=None,
+) -> tuple[float, float]:
+    """Sluit (een deel van) een v2-positie met een reduce-only MARKET-order.
+    Retourneert (filled_qty, avg_price)."""
+    client = client or await _get_client()
+    apex_symbol = _apex_symbol(base_symbol)
+    filled_qty, avg_px, _order_id = await _place_market_order(
+        client, apex_symbol, is_buy=exit_is_buy, qty=sz, reduce_only=True,
+    )
+    return filled_qty, avg_px
+
+
+def _cumulative_target_pct(target_number: int) -> float:
+    """Som van TP_EVENT_TARGETn_CLOSE_PCT t/m (inclusief) target_number, voor
+    target_number 1 t/m 4 (target 5 heeft geen eigen %, zie
+    _handle_tp5_event)."""
+    pcts = [
+        config.TP_EVENT_TARGET1_CLOSE_PCT,
+        config.TP_EVENT_TARGET2_CLOSE_PCT,
+        config.TP_EVENT_TARGET3_CLOSE_PCT,
+        config.TP_EVENT_TARGET4_CLOSE_PCT,
+    ]
+    return sum(pcts[:target_number])
+
+
+def _target_close_qty(pos: dict, cum_pct: float) -> float:
+    """Hoeveel er NU dicht moet voor een target met cumulatief percentage
+    `cum_pct` van de ORIGINELE qty: het verschil tussen wat er in totaal al
+    dicht had moeten zijn t/m deze target, en wat er al écht dicht is (qty -
+    remaining_qty). Zo loopt een deel-close die een eerdere target oversloeg
+    wegens MIN_NOTIONAL_USD automatisch mee in de eerstvolgende target die
+    wel boven de grens uitkomt -- geen aparte "carry"-state nodig."""
+    step_size = pos["step_size"]
+    total_should_be_closed = _round_sz(pos["qty"] * (cum_pct / 100), step_size)
+    already_closed = _round_sz(pos["qty"] - pos["remaining_qty"], step_size)
+    close_qty = _round_sz(total_should_be_closed - already_closed, step_size)
+    # Nooit meer sluiten dan er nog over is (dekt afrondingsverschillen af).
+    return max(0.0, min(close_qty, pos["remaining_qty"]))
+
+
+async def _handle_position_already_closed(key: str, symbol: str, context: str):
+    """State opschonen wanneer een reduce-only close/SL-cancel faalt omdat de
+    positie al (buiten de bot om, bv. via een getriggerde break-even-SL)
+    volledig gesloten bleek te zijn -- voorkomt dat elk volgend TP/cancel-event
+    voor dezelfde positie op dezelfde stale state blijft crashen."""
+    async with _state_lock:
+        state = _load_state()
+        state.pop(key, None)
+        _save_state(state)
+    log.info(
+        "%s voor %s: positie bleek al gesloten (waarschijnlijk break-even-SL) -- state opgeschoond.",
+        context, symbol,
+    )
+    db.log_tp_event(
+        symbol=symbol, event="tp_event_position_already_closed",
+        detail=f"{context}: positie al gesloten buiten de bot om, state opgeschoond",
+    )
+    await _notify(f"ℹ️ {symbol} ({context}) — positie bleek al gesloten (waarschijnlijk SL), state opgeschoond")
+
+
+async def place_entry_order(signal: Signal, dry_run: bool = False, client=None):
     """
     v2-entry (geldt voor alle NIEUWE signals): qty wordt direct afgeleid van
     config.MAX_MARGIN_PCT_OF_FUNDS% van het op dat moment beschikbare saldo
     (zie _calc_margin_based_qty) -- dus de margin die een trade kost staat
-    vooraf vast als percentage, ongeacht welke leverage Hyperliquid voor die
+    vooraf vast als percentage, ongeacht welke leverage ApeX Omni voor die
     specifieke coin toestaat. Alleen een SL bij entry -- geen TP-trigger-order
-    meer (zie moduledocstring). `exchange`/`info` zijn optioneel
-    injecteerbaar zodat tests fakes kunnen doorgeven als expliciete
-    functie-argumenten, i.p.v. te vertrouwen op monkeypatching van
-    _get_exchange()/_get_info() (die aanpak faalde eerder op een manier die
-    niet met zekerheid herleid kon worden -- dependency injection maakt dat
-    hele faalpad onmogelijk)."""
+    (zie moduledocstring). `client` is optioneel injecteerbaar zodat tests een
+    fake object kunnen doorgeven als expliciet functie-argument."""
     base_symbol = signal.symbol.replace("USDT", "")
 
-    # Veiligheidsnet tegen duplicaat-signals van het kanaal (incident
-    # 2026-08-14: exact dezelfde HYPE-entry kwam 2x binnen binnen 5s, wat 2
-    # losse orders plaatste; de tweede overschreef de v2-state van de eerste
-    # -- diens sl_oid/remaining_qty raakten kwijt, dus toen de cancel later
-    # binnenkwam sloot die alleen de (getrackte) tweede order en bleef de
-    # eerste ongezien open staan op Hyperliquid tot 'ie handmatig gesloten
-    # werd). Zo'n duplicaat komt vrijwel nooit voor, en als het gebeurt gaat
-    # het om (bijna-)gelijktijdige berichten -- daarom alleen als duplicaat
-    # behandelen als de vorige v2-positie voor dit symbol+side hooguit
-    # DUPLICATE_POSITION_WINDOW_SECONDS geleden geopend is. Een later signaal
-    # (uren/dagen na de vorige positie) is een echt nieuw signaal en moet
-    # gewoon uitgevoerd worden, ook al staat de vorige positie nog open.
+    # Veiligheidsnet tegen duplicaat-signals van het kanaal (zie de
+    # Hyperliquid-versie's incident van 2026-08-14 -- deze logica is
+    # ongewijzigd overgenomen, exchange-onafhankelijk).
     async with _state_lock:
         state = _load_state()
     existing_key = f"{base_symbol}:{signal.side}"
     existing = state.get(existing_key, {})
     existing_age = time.time() - existing.get("opened_at", 0)
 
-    # Same-side re-entry (positie al open, ouder dan het duplicaat-venster --
-    # dus WEL uitvoeren, zie de reasoning hierboven). Hyperliquid kent maar
-    # één netto positie per coin (geen hedge-mode): deze nieuwe order voegt
-    # zich op de exchange zelf al samen met de bestaande positie. Vroeger
-    # overschreef place_entry_order() de state daarna gewoon met ALLEEN de
-    # nieuwe order-gegevens (qty = alleen de nieuwe fill, sl_oid van de oude
-    # positie kwijt) -- exact het 2026-08-14-incident hierboven, maar dan
-    # getriggerd door een late, legitieme re-entry i.p.v. een near-duplicate
-    # bericht. is_reentry hieronder zorgt dat de oude SL netjes wordt
-    # geannuleerd en de nieuwe state de ECHTE (samengevoegde) positiegrootte
-    # van Hyperliquid zelf gebruikt i.p.v. zelf te herberekenen.
     is_reentry = existing.get("version") == "v2" and existing_age > DUPLICATE_POSITION_WINDOW_SECONDS
     if is_reentry:
         log.info(
@@ -448,65 +568,43 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         )
         return None
 
-    # Incident 2026-09-08: PENGU:Buy bleef in state staan nadat zijn SL
-    # buiten de bot om triggerde (resting SL, geen Telegram-event); de
-    # daaropvolgende PENGU:Sell-entry werd gewoon geplaatst zonder ooit te
-    # checken of er nog een v2-record voor de TEGENOVERGESTELDE kant openstond
-    # -- de same-side check hierboven kijkt alleen naar exact dezelfde kant.
-    # Gevolg: twee "open" v2-records voor dezelfde coin in state, waardoor
-    # elk later TP/cancel-event voor die coin als ambigu werd genegeerd (zie
-    # handle_tp_event()) en 4 TP-targets nooit werden uitgevoerd op de
-    # echt-nog-open Sell-positie. Hyperliquid kent geen hedge-mode (maar één
-    # netto positie per coin), dus vóór een nieuwe entry altijd verifiëren of
-    # een tegengesteld v2-record nog ECHT open staat.
+    client = client or await _get_client()
+
+    # Zelfde tegengestelde-positie-guard als de Hyperliquid-versie (incident
+    # 2026-09-08): ApeX Omni kent, net als Hyperliquid, geen hedge-mode (maar
+    # één netto positie per coin), dus vóór een nieuwe entry altijd
+    # verifiëren of een tegengesteld v2-record nog ECHT open staat.
     opposite_side = "Sell" if signal.side == "Buy" else "Buy"
     opposite_key = f"{base_symbol}:{opposite_side}"
     async with _state_lock:
         state = _load_state()
         opposite = state.get(opposite_key)
-    # live_open_count wordt hieronder meegegeven aan de max-posities-check
-    # zodat die niet nog een keer apart user_state() hoeft op te vragen --
-    # zelfde snapshot, één /info-call in plaats van twee.
-    live_open_count = None
+    live_positions = None
     if opposite is not None and opposite.get("version") == "v2":
-        perp_state = await _call((info or _get_info()).user_state, get_owner_address())
-        live = _parse_live_positions(perp_state).get(base_symbol)
-        live_open_count = len(perp_state.get("assetPositions", []))
+        live_positions = await _fetch_live_positions(client)
+        live = live_positions.get(base_symbol)
         if live is not None and live["is_buy"] == opposite.get("is_buy"):
-            # Nog echt open op Hyperliquid -- een nieuwe order in de andere
-            # richting zou hier zelf tegenin netten/flippen op de exchange,
-            # wat twee losse volledige state-records niet meer correct kunnen
-            # weergeven. Niet automatisch plaatsen, handmatig laten beslissen.
             log.warning(
-                "Tegengestelde v2-positie (%s) nog open op Hyperliquid bij nieuw %s-signaal voor %s "
+                "Tegengestelde v2-positie (%s) nog open op ApeX Omni bij nieuw %s-signaal voor %s "
                 "-- overgeslagen, handmatig checken (zou netten/flippen op de exchange).",
                 opposite_key, signal.side, signal.symbol,
             )
             db.log_order(
                 symbol=signal.symbol, side=signal.side, dry_run=dry_run,
                 status="skipped_opposite_position_open", leverage=signal.leverage, stop_loss=signal.stop_loss,
-                error=f"tegengestelde v2-positie {opposite_key} nog open op Hyperliquid",
+                error=f"tegengestelde v2-positie {opposite_key} nog open op ApeX Omni",
             )
             await _notify(
                 f"⚠️ {signal.side} {signal.symbol} overgeslagen: tegengestelde positie ({opposite_key}) "
-                f"staat nog open op Hyperliquid. Zou netten/flippen op de exchange -- handmatig checken."
+                f"staat nog open op ApeX Omni. Zou netten/flippen op de exchange -- handmatig checken."
             )
             return None
-        # Niet meer echt open -- buiten de bot om gesloten (bv. resting SL).
-        # Stale record opruimen zodat de nieuwe entry hieronder een schone
-        # lei heeft.
         log.warning(
-            "Tegengestelde v2-positie %s bleek niet meer open op Hyperliquid bij nieuw %s-signaal "
+            "Tegengestelde v2-positie %s bleek niet meer open op ApeX Omni bij nieuw %s-signaal "
             "voor %s -- stale state opgeruimd.",
             opposite_key, signal.side, signal.symbol,
         )
-        # Zelfde PnL-schatting als reconcile_positions() gebruikt voor exact
-        # dit soort "buiten de bot om gesloten"-detectie -- zodat de melding
-        # niet verschilt afhankelijk van welke van de twee het als eerste
-        # opmerkt (zie _estimate_realized_pnl_since).
-        realized_pnl = await _estimate_realized_pnl_since(
-            base_symbol, opposite.get("opened_at", 0), get_owner_address(), info or _get_info()
-        )
+        realized_pnl = await _estimate_realized_pnl_since(base_symbol, opposite.get("opened_at", 0), client)
         pnl_txt = f"~${realized_pnl:.2f}" if realized_pnl is not None else "onbekend"
         async with _state_lock:
             state = _load_state()
@@ -514,19 +612,19 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
             _save_state(state)
         db.log_tp_event(
             symbol=base_symbol, event="position_closed_externally_detected",
-            detail=f"key={opposite_key}, niet meer open op Hyperliquid bij nieuw tegengesteld signaal, "
+            detail=f"key={opposite_key}, niet meer open op ApeX Omni bij nieuw tegengesteld signaal, "
                    f"state opgeruimd, PnL sinds entry: {pnl_txt}",
         )
         await _notify(
-            f"⚠️ {opposite_key} bleek al gesloten op Hyperliquid (ontdekt bij nieuw tegengesteld "
+            f"⚠️ {opposite_key} bleek al gesloten op ApeX Omni (ontdekt bij nieuw tegengesteld "
             f"{signal.side}-signaal voor {signal.symbol}) -- state opgeruimd. Gerealiseerde PnL sinds "
             f"entry: {pnl_txt}."
         )
 
-    open_count = live_open_count if live_open_count is not None else await count_open_positions(info=info)
+    open_count = len(live_positions) if live_positions is not None else await count_open_positions(client)
     if open_count >= config.MAX_CONCURRENT_POSITIONS:
         log.warning(
-            "Gemiste trade wegens max posities: %s %s overgeslagen (%d/%d open live posities op Hyperliquid).",
+            "Gemiste trade wegens max posities: %s %s overgeslagen (%d/%d open live posities op ApeX Omni).",
             signal.side, signal.symbol, open_count, config.MAX_CONCURRENT_POSITIONS,
         )
         db.log_order(
@@ -541,7 +639,7 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         return None
 
     try:
-        market = await get_market_info(base_symbol, info=info)
+        market = await get_market_info(base_symbol, client=client)
     except ValueError as e:
         log.warning("Order overgeslagen: %s", e)
         db.log_order(
@@ -553,19 +651,18 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
     used_leverage = min(signal.leverage, market["max_leverage"])
     if used_leverage < signal.leverage:
         log.info(
-            "Signal vroeg %sx, Hyperliquid staat max %sx toe voor %s -> gebruik %sx",
+            "Signal vroeg %sx, ApeX Omni staat max %sx toe voor %s -> gebruik %sx",
             signal.leverage, market["max_leverage"], signal.symbol, used_leverage,
         )
 
-    sz_decimals = market["sz_decimals"]
+    apex_symbol = market["apex_symbol"]
+    step_size = market["step_size"]
+    tick_size = market["tick_size"]
     is_buy = signal.side == "Buy"
     exit_is_buy = not is_buy
 
-    # Eén gedeelde state-fetch voor zowel withdrawable als total_equity (zie
-    # _fetch_funds_state) -- zelfde aantal API-calls als voorheen, en beide
-    # getallen komen uit exact dezelfde snapshot.
-    perp_state, spot_state = await _fetch_funds_state(info=info)
-    withdrawable = _withdrawable_from_state(perp_state, spot_state)
+    balance = await _fetch_account_balance(client)
+    withdrawable = _withdrawable_from_balance(balance)
     if withdrawable <= 0:
         log.warning(
             "Gemiste trade wegens geen beschikbaar saldo: %s %s overgeslagen (beschikbaar $%.2f).",
@@ -582,25 +679,15 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         )
         return None
 
-    # qty mikt op MAX_MARGIN_PCT_OF_FUNDS% van de TOTALE accountwaarde (niet
-    # van withdrawable) zodat het bedrag per trade niet steeds kleiner wordt
-    # naarmate er al meer posities tegelijk open staan (zie
-    # _total_equity_from_state).
-    total_equity = _total_equity_from_state(perp_state, spot_state)
-    qty = _calc_margin_based_qty(market["mark_px"], used_leverage, total_equity, sz_decimals)
+    total_equity = _total_equity_from_balance(balance)
+    qty = _calc_margin_based_qty(market["mark_px"], used_leverage, total_equity, step_size)
     notional = qty * market["mark_px"]
     margin_needed = notional / used_leverage
 
-    # Hyperliquid weigert orders onder MIN_NOTIONAL_USD (zelf geverifieerd via
-    # hun docs). Bij een klein beschikbaar saldo (of qty die naar 0 afrondt op
-    # szDecimals) kan de op MAX_MARGIN_PCT_OF_FUNDS gebaseerde qty daaronder
-    # uitkomen -- net als "geen beschikbaar saldo" hierboven is dit een
-    # normale, te verwachten toestand (te weinig ruimte nu), geen
-    # configuratieprobleem, dus overslaan i.p.v. een fout opgooien.
     if qty <= 0 or notional < config.MIN_NOTIONAL_USD:
         log.warning(
             "Gemiste trade wegens te kleine ordergrootte: %s %s overgeslagen "
-            "(qty=%s, notional=$%.2f, Hyperliquid-minimum $%.0f -- %s%% van $%.2f totale accountwaarde bij %sx).",
+            "(qty=%s, notional=$%.2f, minimum $%.0f -- %s%% van $%.2f totale accountwaarde bij %sx).",
             signal.side, signal.symbol, qty, notional, config.MIN_NOTIONAL_USD,
             config.MAX_MARGIN_PCT_OF_FUNDS, total_equity, used_leverage,
         )
@@ -612,15 +699,10 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         )
         await _notify(
             f"⏭️ Gemiste trade wegens te kleine ordergrootte: {signal.side} {signal.symbol} "
-            f"(notional ${notional:.2f} onder Hyperliquid's ${config.MIN_NOTIONAL_USD:.0f}-minimum)"
+            f"(notional ${notional:.2f} onder ${config.MIN_NOTIONAL_USD:.0f}-minimum)"
         )
         return None
 
-    # De qty is gebaseerd op de TOTALE accountwaarde, maar of hij ook echt
-    # past hangt af van wat er NU nog vrij is (withdrawable) -- bv. omdat er
-    # al andere posities open staan die marge vasthouden. Zonder deze check
-    # zou Hyperliquid de order gewoon afwijzen (RuntimeError via
-    # _check_order_status) i.p.v. een nette, verwachte skip.
     if margin_needed > withdrawable:
         log.warning(
             "Gemiste trade wegens onvoldoende vrije marge: %s %s overgeslagen "
@@ -638,17 +720,15 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         )
         return None
 
-    # SL op de volle qty, onafhankelijk actief op Hyperliquid -- beschermt
-    # tussen entry en het eerste TP-bericht van de groep. Geen TP-trigger-
-    # order meer (zie moduledocstring): sluiten gebeurt via handle_tp_event().
-    sl_trigger = _round_px(signal.stop_loss, sz_decimals)
+    sl_trigger = _round_px(signal.stop_loss, tick_size)
     sl_limit = _round_px(
-        sl_trigger * (1 - TRIGGER_LIMIT_BUFFER_PCT if is_buy else 1 + TRIGGER_LIMIT_BUFFER_PCT), sz_decimals
+        sl_trigger * (1 - TRIGGER_LIMIT_BUFFER_PCT if is_buy else 1 + TRIGGER_LIMIT_BUFFER_PCT), tick_size
     )
 
     plan = {
         "coin": base_symbol,
-        "leverage": {"value": used_leverage, "is_cross": False},
+        "apex_symbol": apex_symbol,
+        "leverage": used_leverage,
         "leverage_requested": signal.leverage,
         "leverage_max_allowed": market["max_leverage"],
         "leverage_capped": used_leverage < signal.leverage,
@@ -656,49 +736,36 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         "margin_pct_of_funds": config.MAX_MARGIN_PCT_OF_FUNDS,
         "margin_needed": margin_needed,
         "withdrawable": withdrawable,
-        "entry_order": {"coin": base_symbol, "is_buy": is_buy, "sz": qty, "order_type": {"limit": {"tif": "Ioc"}}},
+        "entry_order": {"symbol": apex_symbol, "side": "BUY" if is_buy else "SELL", "type": "MARKET", "size": qty},
         "sl_order": {
-            "coin": base_symbol, "is_buy": exit_is_buy, "sz": qty, "limit_px": sl_limit,
-            "order_type": {"trigger": {"triggerPx": sl_trigger, "isMarket": True, "tpsl": "sl"}},
-            "reduce_only": True,
+            "symbol": apex_symbol, "side": "BUY" if exit_is_buy else "SELL", "type": "STOP_MARKET",
+            "size": qty, "triggerPrice": sl_trigger, "price": sl_limit, "reduceOnly": True,
         },
     }
 
     if dry_run:
-        log.info("[DRY RUN] Zou plaatsen op Hyperliquid:\n%s", json.dumps(plan, indent=2))
+        log.info("[DRY RUN] Zou plaatsen op ApeX Omni:\n%s", json.dumps(plan, indent=2))
         db.log_order(
             symbol=signal.symbol, side=signal.side, dry_run=True, status="dry_run",
             entry_price=market["mark_px"], leverage=used_leverage, qty=qty, stop_loss=sl_trigger,
         )
         return plan
 
-    exchange = exchange or _get_exchange()
+    # Isolated margin via initialMarginRate = 1/leverage (i.p.v. cross) zodat
+    # elke trade z'n risico beperkt houdt tot deze ene positie.
+    imr = str(round(1 / used_leverage, 6))
+    lev_resp = await _call(client.set_initial_margin_rate_v3, symbol=apex_symbol, initialMarginRate=imr)
+    _check_order_status(lev_resp, "leverage/margin-rate zetten")
 
-    # Isolated margin (i.p.v. cross) zodat elke trade z'n risico beperkt
-    # houdt tot deze ene positie.
-    lev_resp = await _call(exchange.update_leverage, used_leverage, base_symbol, False)
-    _check_order_status(lev_resp, "update_leverage")
-
-    open_resp = await _call(exchange.market_open, base_symbol, is_buy, qty)
-    statuses = _check_order_status(open_resp, "market_open")
-    if not statuses or "filled" not in statuses[0]:
-        raise RuntimeError(f"Entry-order voor {signal.symbol} is niet (meteen) gevuld: {open_resp}")
-
-    filled = statuses[0]["filled"]
-    filled_qty = float(filled["totalSz"])
-    entry_price = float(filled["avgPx"])
+    filled_qty, entry_price, _order_id = await _place_market_order(
+        client, apex_symbol, is_buy=is_buy, qty=qty, reduce_only=False,
+    )
     log.info(
         "Order geplaatst (v2, %s%% van saldo): %s %s qty=%.6f @ %s (%sx, margin~$%.2f)",
         config.MAX_MARGIN_PCT_OF_FUNDS, signal.side, signal.symbol, filled_qty, entry_price,
         used_leverage, margin_needed,
     )
 
-    # sl_qty/state_qty/state_entry_price zijn bij een gewone (niet-re-entry)
-    # trade gewoon de fill van hierboven. Bij een re-entry vervangen we ze
-    # door de ECHTE, samengevoegde positie zoals Hyperliquid die zelf
-    # rapporteert (autoritatief -- zie is_reentry hierboven), en annuleren we
-    # eerst de oude SL zodat er nooit twee SL-orders voor dezelfde positie
-    # naast elkaar resten.
     sl_qty = filled_qty
     state_qty = filled_qty
     state_entry_price = entry_price
@@ -706,38 +773,27 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
         old_sl_oid = existing.get("sl_oid")
         if old_sl_oid is not None:
             try:
-                cancel_resp = await _call(exchange.cancel, base_symbol, old_sl_oid)
-                _check_order_status(cancel_resp, "oude SL annuleren (re-entry)")
+                await _cancel_order(client, old_sl_oid, "oude SL annuleren (re-entry)")
             except Exception:
                 log.exception("Kon oude SL niet annuleren voor %s bij re-entry", base_symbol)
         else:
             log.warning("Geen sl_oid bekend voor bestaande %s-positie bij re-entry.", existing_key)
 
-        live_pos = await _get_live_position(base_symbol, get_owner_address(), info=info)
+        live_pos = await _get_live_position(base_symbol, client=client)
         if live_pos is not None and live_pos["is_buy"] == is_buy:
             sl_qty = live_pos["qty"]
             state_qty = live_pos["qty"]
             state_entry_price = live_pos["entry_price"]
         else:
-            # Kon de echte samengevoegde positie niet bevestigen (bv. de oude
-            # positie bleek intussen al extern gesloten) -- veiligste fallback
-            # is de nieuwe fill als op zichzelf staande positie te behandelen
-            # i.p.v. te gokken op een samengevoegde qty die niet klopt.
             log.warning(
-                "Kon samengevoegde positie voor %s niet bevestigen bij Hyperliquid -- "
+                "Kon samengevoegde positie voor %s niet bevestigen bij ApeX Omni -- "
                 "state behandelt alleen de nieuwe fill (%.6f) als positie.",
                 base_symbol, filled_qty,
             )
 
-    sl_resp = await _call(
-        exchange.order, base_symbol, exit_is_buy, sl_qty, sl_limit,
-        {"trigger": {"triggerPx": sl_trigger, "isMarket": True, "tpsl": "sl"}},
-        reduce_only=True,
-    )
-    sl_statuses = _check_order_status(sl_resp, "stop-loss plaatsen")
-    sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+    sl_oid = await _place_stop_order(client, apex_symbol, exit_is_buy, sl_qty, sl_trigger, sl_limit)
     if sl_oid is None:
-        log.warning("Kon geen order-id voor de stop-loss achterhalen uit response: %s", sl_resp)
+        log.warning("Kon geen order-id voor de stop-loss achterhalen.")
 
     async with _state_lock:
         state = _load_state()
@@ -754,7 +810,8 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
             "tp2_done": False,
             "tp3_done": False,
             "tp4_done": False,
-            "sz_decimals": sz_decimals,
+            "tick_size": tick_size,
+            "step_size": step_size,
             "banked_pnl": 0.0,
             "opened_at": time.time(),
         }
@@ -779,98 +836,14 @@ async def place_entry_order(signal: Signal, dry_run: bool = False, exchange=None
     return f"qty={filled_qty} @ {entry_price} ({used_leverage}x, {config.MAX_MARGIN_PCT_OF_FUNDS}% van saldo)"
 
 
-async def _market_close_reduce_only(
-    base_symbol: str, exit_is_buy: bool, sz: float, sz_decimals: int,
-    exchange=None, info=None, mark_px: float = None,
-):
-    """Sluit (een deel van) een v2-positie met een agressieve reduce-only
-    IOC-limit-order -- zelfde "market order" aanpak als market_open(), maar
-    via exchange.order() i.p.v. de SDK's market_close() helper, want die
-    laatste doet zelf een niet-injecteerbare user_state-call om de
-    positierichting op te zoeken (zou dependency injection in tests
-    omzeilen). Wij kennen exit_is_buy/sz al uit onze eigen state.
-
-    `mark_px` is optioneel voor te geven als de aanroeper 'm al heeft
-    opgehaald (bv. voor een MIN_NOTIONAL_USD-check vooraf) -- scheelt dan een
-    dubbele get_market_info()-call."""
-    if mark_px is None:
-        market = await get_market_info(base_symbol, info=info)
-        mark_px = market["mark_px"]
-    limit_px = _round_px(
-        mark_px * (1 + TRIGGER_LIMIT_BUFFER_PCT if exit_is_buy else 1 - TRIGGER_LIMIT_BUFFER_PCT), sz_decimals
-    )
-    exchange = exchange or _get_exchange()
-    resp = await _call(
-        exchange.order, base_symbol, exit_is_buy, sz, limit_px,
-        {"limit": {"tif": "Ioc"}}, reduce_only=True,
-    )
-    return _check_order_status(resp, f"reduce-only close ({sz} {base_symbol})")
-
-
-def _cumulative_target_pct(target_number: int) -> float:
-    """Som van TP_EVENT_TARGETn_CLOSE_PCT t/m (inclusief) target_number, voor
-    target_number 1 t/m 4 (target 5 heeft geen eigen %, zie
-    _handle_tp5_event)."""
-    pcts = [
-        config.TP_EVENT_TARGET1_CLOSE_PCT,
-        config.TP_EVENT_TARGET2_CLOSE_PCT,
-        config.TP_EVENT_TARGET3_CLOSE_PCT,
-        config.TP_EVENT_TARGET4_CLOSE_PCT,
-    ]
-    return sum(pcts[:target_number])
-
-
-def _target_close_qty(pos: dict, cum_pct: float) -> float:
-    """Hoeveel er NU dicht moet voor een target met cumulatief percentage
-    `cum_pct` van de ORIGINELE qty: het verschil tussen wat er in totaal al
-    dicht had moeten zijn t/m deze target, en wat er al écht dicht is
-    (qty - remaining_qty). Zo loopt een deel-close die een eerdere target
-    oversloeg wegens MIN_NOTIONAL_USD automatisch mee in de eerstvolgende
-    target die wel boven de grens uitkomt -- geen aparte "carry"-state
-    nodig."""
-    sz_decimals = pos["sz_decimals"]
-    total_should_be_closed = _round_sz(pos["qty"] * (cum_pct / 100), sz_decimals)
-    already_closed = _round_sz(pos["qty"] - pos["remaining_qty"], sz_decimals)
-    close_qty = _round_sz(total_should_be_closed - already_closed, sz_decimals)
-    # Nooit meer sluiten dan er nog over is (dekt afrondingsverschillen af).
-    return max(0.0, min(close_qty, pos["remaining_qty"]))
-
-
-async def _handle_position_already_closed(key: str, symbol: str, context: str):
-    """State opschonen wanneer een reduce-only close/SL-cancel faalt omdat de
-    positie al (buiten de bot om, bv. via een getriggerde break-even-SL)
-    volledig gesloten bleek te zijn -- voorkomt dat elk volgend TP/cancel-event
-    voor dezelfde positie op dezelfde stale state blijft crashen."""
-    async with _state_lock:
-        state = _load_state()
-        state.pop(key, None)
-        _save_state(state)
-    log.info(
-        "%s voor %s: positie bleek al gesloten (waarschijnlijk break-even-SL) -- state opgeschoond.",
-        context, symbol,
-    )
-    db.log_tp_event(
-        symbol=symbol, event="tp_event_position_already_closed",
-        detail=f"{context}: positie al gesloten buiten de bot om, state opgeschoond",
-    )
-    await _notify(f"ℹ️ {symbol} ({context}) — positie bleek al gesloten (waarschijnlijk SL), state opgeschoond")
-
-
-async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, exchange=None, info=None):
-    """Generieke handler voor targets 1 t/m 4: sluit het cumulatieve
-    percentage van de ORIGINELE qty dat nog niet dicht is (zie
-    _target_close_qty). Valt de notional van die deel-close onder
-    MIN_NOTIONAL_USD, dan wordt deze stap overgeslagen (remaining_qty blijft
-    ongewijzigd, target als "verwerkt" gemarkeerd zodat een duplicaat-event
-    'm niet opnieuw probeert) -- de eerstvolgende target (uiteindelijk altijd
-    target 5) sluit dan automatisch het opgestapelde verschil mee. Bij target
-    config.BREAKEVEN_MOVE_AFTER_TARGET wordt daarnaast de SL verplaatst naar
-    een dynamische break-even op basis van de ECHT gebankte winst uit eerdere
-    targets (zie config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT), ongeacht of de
-    close zelf is uitgevoerd of doorgeschoven naar later -- pas later dan
-    target 1 zodat een normale terugval na een vroege, kleine TP1 niet meteen
-    de hele rest van de positie eruit gooit voordat latere targets ooit
-    geraakt worden (incident 2026-08-25: PENGU/BTC/HYPE)."""
+async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, client=None):
+    """Generieke handler voor targets 1 t/m 4 (ONGEWIJZIGDE logica t.o.v. de
+    Hyperliquid-versie, zie config.py voor de incident-geschiedenis achter
+    elk detail hieronder): sluit het cumulatieve percentage van de ORIGINELE
+    qty dat nog niet dicht is (zie _target_close_qty). Bij target
+    config.BREAKEVEN_MOVE_AFTER_TARGET wordt de SL verplaatst naar een
+    dynamische break-even op basis van de ECHT gebankte winst uit eerdere
+    targets."""
     symbol = pos["symbol"]
     done_key = f"tp{target_number}_done"
     if pos.get(done_key):
@@ -880,13 +853,14 @@ async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, exch
         )
         return
 
-    sz_decimals = pos["sz_decimals"]
+    step_size = pos["step_size"]
+    tick_size = pos["tick_size"]
     exit_is_buy = not pos["is_buy"]
     cum_pct = _cumulative_target_pct(target_number)
     close_qty = _target_close_qty(pos, cum_pct)
 
-    exchange = exchange or _get_exchange()
-    market = await get_market_info(symbol, info=info)
+    client = client or await _get_client()
+    market = await get_market_info(symbol, client=client)
     mark_px = market["mark_px"]
     notional = close_qty * mark_px
 
@@ -907,58 +881,31 @@ async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, exch
         )
     else:
         try:
-            close_statuses = await _market_close_reduce_only(
-                symbol, exit_is_buy, close_qty, sz_decimals, exchange=exchange, info=info, mark_px=mark_px,
-            )
+            avg_px, filled_close_qty = None, None
+            filled_close_qty, avg_px = await _market_close_reduce_only(symbol, exit_is_buy, close_qty, client=client)
         except RuntimeError as e:
             if _is_position_already_closed_error(e):
                 await _handle_position_already_closed(key, symbol, f"target {target_number}")
                 return
             raise
 
-        # Winst van DEZE stap = wat de close-order echt ophaalde (avgPx uit de
-        # fill, net als bij de entry-order in place_entry_order) t.o.v. de
-        # entry-prijs -- basis voor de dynamische break-even-berekening
-        # hieronder (zie config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT).
-        filled = close_statuses[0].get("filled") if close_statuses else None
-        avg_px = float(filled["avgPx"]) if filled else mark_px
         step_pnl = close_qty * (avg_px - pos["entry_price"]) * (1 if pos["is_buy"] else -1)
         banked_pnl += step_pnl
-        remaining_qty = _round_sz(pos["remaining_qty"] - close_qty, sz_decimals)
+        remaining_qty = _round_sz(pos["remaining_qty"] - close_qty, step_size)
 
     new_sl_oid = pos.get("sl_oid")
     sl_price = pos.get("sl_price")
     moves_to_breakeven = target_number == config.BREAKEVEN_MOVE_AFTER_TARGET
     if moves_to_breakeven:
-        # Oude SL vervangen door een gebufferde break-even-SL voor de rest.
         sl_oid = pos.get("sl_oid")
         if sl_oid is not None:
             try:
-                cancel_resp = await _call(exchange.cancel, symbol, sl_oid)
-                _check_order_status(cancel_resp, "oorspronkelijke SL annuleren (break-even-shift)")
+                await _cancel_order(client, sl_oid, "oorspronkelijke SL annuleren (break-even-shift)")
             except Exception:
                 log.exception("Kon originele SL niet annuleren voor %s bij break-even-shift", symbol)
         else:
             log.warning("Geen sl_oid bekend voor %s bij break-even-shift -- plaats break-even-SL toch.", symbol)
 
-        # Break-even-trigger op basis van de ECHTE, al gebankte winst uit
-        # eerdere targets (zie config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT): het
-        # prijsniveau waarbij de HELE trade (banked_pnl + PnL op het restant)
-        # op $0 uitkomt, min een veiligheidsmarge voor fees/slippage.
-        # `available` is geclamped op 0, dus dit kan nooit slechter zijn dan
-        # exacte entry-prijs.
-        #
-        # banked_pnl is BRUTO (zie step_pnl hierboven -- geen enkele fee wordt
-        # ooit afgetrokken, ook de entry-fee niet). Incident 2026-09-01: PENGU
-        # raakte TP1+TP2, banked_pnl was bruto +$3,65, maar na entry-fee +
-        # fees op TP1/TP2/de break-even-close (~$0,81 totaal) sloot de trade
-        # netto op -$0,23 -- de marge was te klein (0,1% van alleen de
-        # RESTERENDE notional, dus kromp precies wanneer er meer eerdere
-        # targets al gesloten waren) om zowel de al-betaalde entry-fee als de
-        # nog te betalen close-fee te dekken. Marge nu over de ORIGINELE
-        # notional (blijft dus constant, ongeacht hoeveel al dicht is) i.p.v.
-        # de resterende, plus een hoger percentage (zie config) dat het
-        # volledige entry+exit fee-rondje op de originele notional dekt.
         if remaining_qty > 0:
             original_notional = pos["qty"] * pos["entry_price"]
             safety = original_notional * (config.BREAKEVEN_PNL_SAFETY_MARGIN_PCT / 100)
@@ -967,19 +914,13 @@ async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, exch
         else:
             offset = 0.0
         be_trigger = _round_px(
-            pos["entry_price"] - offset if pos["is_buy"] else pos["entry_price"] + offset, sz_decimals,
+            pos["entry_price"] - offset if pos["is_buy"] else pos["entry_price"] + offset, tick_size,
         )
         be_limit = _round_px(
             be_trigger * (1 - TRIGGER_LIMIT_BUFFER_PCT if pos["is_buy"] else 1 + TRIGGER_LIMIT_BUFFER_PCT),
-            sz_decimals,
+            tick_size,
         )
-        be_sl_resp = await _call(
-            exchange.order, symbol, exit_is_buy, remaining_qty, be_limit,
-            {"trigger": {"triggerPx": be_trigger, "isMarket": True, "tpsl": "sl"}},
-            reduce_only=True,
-        )
-        sl_statuses = _check_order_status(be_sl_resp, "break-even SL plaatsen (break-even-shift)")
-        new_sl_oid = sl_statuses[0].get("resting", {}).get("oid") if sl_statuses else None
+        new_sl_oid = await _place_stop_order(client, _apex_symbol(symbol), exit_is_buy, remaining_qty, be_trigger, be_limit)
         sl_price = be_trigger
 
     async with _state_lock:
@@ -1018,50 +959,44 @@ async def _handle_tp_partial_event(key: str, pos: dict, target_number: int, exch
         )
 
 
-async def _handle_tp1_event(key: str, pos: dict, exchange=None, info=None):
-    await _handle_tp_partial_event(key, pos, target_number=1, exchange=exchange, info=info)
+async def _handle_tp1_event(key: str, pos: dict, client=None):
+    await _handle_tp_partial_event(key, pos, target_number=1, client=client)
 
 
-async def _handle_tp2_event(key: str, pos: dict, exchange=None, info=None):
-    await _handle_tp_partial_event(key, pos, target_number=2, exchange=exchange, info=info)
+async def _handle_tp2_event(key: str, pos: dict, client=None):
+    await _handle_tp_partial_event(key, pos, target_number=2, client=client)
 
 
-async def _handle_tp3_event(key: str, pos: dict, exchange=None, info=None):
-    await _handle_tp_partial_event(key, pos, target_number=3, exchange=exchange, info=info)
+async def _handle_tp3_event(key: str, pos: dict, client=None):
+    await _handle_tp_partial_event(key, pos, target_number=3, client=client)
 
 
-async def _handle_tp4_event(key: str, pos: dict, exchange=None, info=None):
-    await _handle_tp_partial_event(key, pos, target_number=4, exchange=exchange, info=info)
+async def _handle_tp4_event(key: str, pos: dict, client=None):
+    await _handle_tp_partial_event(key, pos, target_number=4, client=client)
 
 
-async def _handle_tp5_event(key: str, pos: dict, exchange=None, info=None):
+async def _handle_tp5_event(key: str, pos: dict, client=None):
     """Finale exit: sluit ALTIJD de volledige resterende qty (100%), ongeacht
-    MIN_NOTIONAL_USD of afrondingsverschillen -- dit is het eindpunt van de
-    ladder en de uiteindelijke vangnet-fallback voor elke eerdere deel-close
-    die werd doorgeschoven (zie _handle_tp_partial_event)."""
+    MIN_NOTIONAL_USD of afrondingsverschillen."""
     symbol = pos["symbol"]
-    sz_decimals = pos["sz_decimals"]
     exit_is_buy = not pos["is_buy"]
     close_qty = pos["remaining_qty"]
 
-    exchange = exchange or _get_exchange()
+    client = client or await _get_client()
 
     if close_qty <= 0:
         log.warning("TP5-event voor %s ontvangen maar remaining_qty is 0 -- state opgeschoond.", symbol)
         db.log_tp_event(symbol=symbol, event="tp_event_ignored_zero_remaining", detail="target 5, remaining_qty=0")
     else:
-        # SL eerst annuleren, dan pas sluiten -- voorkomt een wees-order die
-        # blijft resten nadat de positie hieronder volledig gesloten is.
         sl_oid = pos.get("sl_oid")
         if sl_oid is not None:
             try:
-                cancel_resp = await _call(exchange.cancel, symbol, sl_oid)
-                _check_order_status(cancel_resp, "SL annuleren (TP5-event)")
+                await _cancel_order(client, sl_oid, "SL annuleren (TP5-event)")
             except Exception:
                 log.exception("Kon SL niet annuleren voor %s bij TP5-event", symbol)
 
         try:
-            await _market_close_reduce_only(symbol, exit_is_buy, close_qty, sz_decimals, exchange=exchange, info=info)
+            await _market_close_reduce_only(symbol, exit_is_buy, close_qty, client=client)
         except RuntimeError as e:
             if _is_position_already_closed_error(e):
                 await _handle_position_already_closed(key, symbol, "target 5")
@@ -1080,28 +1015,12 @@ async def _handle_tp5_event(key: str, pos: dict, exchange=None, info=None):
         _save_state(state)
 
 
-async def handle_cancel_event(cancel_event, exchange=None, info=None):
+async def handle_cancel_event(cancel_event, client=None):
     """
-    Verwerkt een CancelEvent (signal_parser.parse_cancel_event): het kanaal
-    trekt het signal in ("Close X/USDT" + "#X/USDT  Cancelled"), dus de
-    bijbehorende v2-positie wordt volledig gesloten -- zelfde close-logica
-    als _handle_tp3_event (SL eerst annuleren, dan resterende qty
-    reduce-only market-close), ongeacht welke targets al gehaald zijn.
-    Zelfde kandidaat-/ambiguiteit-/DRY_RUN-veiligheidslogica als
-    handle_tp_event() (raakt legacy-posities nooit, want die hebben geen
-    "version": "v2"). Kan twee keer binnenkomen voor dezelfde annulering
-    (het kanaal stuurt "Close X/USDT" en "#X/USDT Cancelled" als losse
-    berichten, vlak na elkaar) -- de tweede keer is er geen kandidaat meer
-    en wordt 'ie stil genegeerd, zelfde als een duplicaat TP-event.
-
-    Kandidaat-selectie EN het claimen ervan (_cancel_in_progress) gebeuren
-    in dezelfde _state_lock-sectie: de twee kanaalberichten komen vaak met
-    maar ~1-2s ertussen binnen, en de eigenlijke SL-cancel/close hierna is
-    een netwerkcall die makkelijk langer duurt dan dat. Zonder deze claim
-    lezen beide events de nog-niet-gepopte state en proberen ze allebei
-    dezelfde SL te annuleren en dezelfde positie te sluiten (geobserveerd
-    2026-08-15: "Order was never placed, already canceled, or filled" en
-    daarna "Reduce only order would increase position").
+    Verwerkt een CancelEvent (signal_parser.parse_cancel_event) -- ONGEWIJZIGDE
+    logica t.o.v. de Hyperliquid-versie (incident 2026-08-15: kandidaat-selectie
+    EN het claimen ervan via _cancel_in_progress gebeuren in dezelfde
+    _state_lock-sectie, zie die versie's docstring voor het volledige incident).
     """
     base_symbol = cancel_event.symbol.replace("USDT", "")
 
@@ -1114,13 +1033,9 @@ async def handle_cancel_event(cancel_event, exchange=None, info=None):
         ]
 
         if not candidates:
-            log.info(
-                "Cancel-event voor %s ontvangen maar geen open v2-positie -- genegeerd.",
-                base_symbol,
-            )
+            log.info("Cancel-event voor %s ontvangen maar geen open v2-positie -- genegeerd.", base_symbol)
             db.log_tp_event(
-                symbol=base_symbol, event="cancel_event_ignored_no_position",
-                detail="geen open v2-positie",
+                symbol=base_symbol, event="cancel_event_ignored_no_position", detail="geen open v2-positie",
             )
             return
 
@@ -1136,7 +1051,7 @@ async def handle_cancel_event(cancel_event, exchange=None, info=None):
             await _notify(
                 f"⚠️ Cancel-event voor {base_symbol} genegeerd: meerdere open posities "
                 f"({[k for k, _ in candidates]}) -- kan niet automatisch bepalen welke. "
-                f"Handmatig checken op Hyperliquid."
+                f"Handmatig checken op ApeX Omni."
             )
             return
 
@@ -1148,16 +1063,11 @@ async def handle_cancel_event(cancel_event, exchange=None, info=None):
                 base_symbol,
             )
             db.log_tp_event(
-                symbol=base_symbol, event="cancel_event_ignored_in_progress",
-                detail=f"key={key}",
+                symbol=base_symbol, event="cancel_event_ignored_in_progress", detail=f"key={key}",
             )
             return
 
         if config.DRY_RUN:
-            # Zelfde veiligheidsnet-redenering als handle_tp_event(): in DRY_RUN
-            # schrijft place_entry_order() nooit een v2-entry naar state, dus als
-            # die er toch is, is er iets mis -- alleen loggen, geen echte
-            # cancel/order-calls.
             log.warning(
                 "DRY_RUN staat aan maar er staat een v2-positie voor %s in state -- dit zou niet "
                 "moeten kunnen. Geen echte cancel/order-calls, alleen loggen (cancel-event).",
@@ -1169,23 +1079,21 @@ async def handle_cancel_event(cancel_event, exchange=None, info=None):
 
     try:
         symbol = pos["symbol"]
-        sz_decimals = pos["sz_decimals"]
         exit_is_buy = not pos["is_buy"]
         close_qty = pos["remaining_qty"]
 
-        exchange = exchange or _get_exchange()
+        client = client or await _get_client()
 
         sl_oid = pos.get("sl_oid")
         if sl_oid is not None:
             try:
-                cancel_resp = await _call(exchange.cancel, symbol, sl_oid)
-                _check_order_status(cancel_resp, "SL annuleren (cancel-event)")
+                await _cancel_order(client, sl_oid, "SL annuleren (cancel-event)")
             except Exception:
                 log.exception("Kon SL niet annuleren voor %s bij cancel-event", symbol)
 
         if close_qty > 0:
             try:
-                await _market_close_reduce_only(symbol, exit_is_buy, close_qty, sz_decimals, exchange=exchange, info=info)
+                await _market_close_reduce_only(symbol, exit_is_buy, close_qty, client=client)
             except RuntimeError as e:
                 if _is_position_already_closed_error(e):
                     await _handle_position_already_closed(key, symbol, "cancel-event")
@@ -1207,16 +1115,10 @@ async def handle_cancel_event(cancel_event, exchange=None, info=None):
             _cancel_in_progress.discard(key)
 
 
-async def handle_tp_event(tp_event, exchange=None, info=None):
+async def handle_tp_event(tp_event, client=None):
     """
-    Verwerkt een TPEvent (signal_parser.parse_tp_event) voor een v2-positie:
-    5-staps ladder, target 1 t/m 4 sluiten elk hun eigen (cumulatieve)
-    percentage van de ORIGINELE qty (target 1 verplaatst ook de SL naar
-    break-even), target 5 sluit altijd de volledige rest (finale exit). Geen
-    open v2-positie voor deze coin -> loggen en negeren (raakt de
-    legacy-posities (TAO/HYPE/PENGU) NOOIT, want die hebben geen
-    "version": "v2" in hun state-entry).
-    """
+    Verwerkt een TPEvent (signal_parser.parse_tp_event) voor een v2-positie --
+    ONGEWIJZIGDE logica t.o.v. de Hyperliquid-versie."""
     base_symbol = tp_event.symbol.replace("USDT", "")
 
     async with _state_lock:
@@ -1250,16 +1152,13 @@ async def handle_tp_event(tp_event, exchange=None, info=None):
         await _notify(
             f"⚠️ TP{tp_event.target_number}-event voor {base_symbol} genegeerd: meerdere open "
             f"posities ({[k for k, _ in candidates]}) -- kan niet automatisch bepalen welke. "
-            f"Handmatig checken op Hyperliquid."
+            f"Handmatig checken op ApeX Omni."
         )
         return
 
     key, pos = candidates[0]
 
     if config.DRY_RUN:
-        # In DRY_RUN schrijft place_entry_order() nooit een v2-entry naar
-        # state, dus als die er toch is, is er iets mis -- alleen loggen,
-        # geen echte cancel/order-calls.
         log.warning(
             "DRY_RUN staat aan maar er staat een v2-positie voor %s in state -- dit zou niet "
             "moeten kunnen. Geen echte cancel/order-calls, alleen loggen (target %d).",
@@ -1268,15 +1167,15 @@ async def handle_tp_event(tp_event, exchange=None, info=None):
         return
 
     if tp_event.target_number == 1:
-        await _handle_tp1_event(key, pos, exchange=exchange, info=info)
+        await _handle_tp1_event(key, pos, client=client)
     elif tp_event.target_number == 2:
-        await _handle_tp2_event(key, pos, exchange=exchange, info=info)
+        await _handle_tp2_event(key, pos, client=client)
     elif tp_event.target_number == 3:
-        await _handle_tp3_event(key, pos, exchange=exchange, info=info)
+        await _handle_tp3_event(key, pos, client=client)
     elif tp_event.target_number == 4:
-        await _handle_tp4_event(key, pos, exchange=exchange, info=info)
+        await _handle_tp4_event(key, pos, client=client)
     elif tp_event.target_number == 5:
-        await _handle_tp5_event(key, pos, exchange=exchange, info=info)
+        await _handle_tp5_event(key, pos, client=client)
     else:
         log.info(
             "TP-event %s target %d ontvangen, buiten de bekende ladder (1-5) -- geen actie.",
@@ -1287,77 +1186,45 @@ async def handle_tp_event(tp_event, exchange=None, info=None):
         )
 
 
-async def _estimate_realized_pnl_since(symbol: str, opened_at, owner: str, info) -> Optional[float]:
-    """Best-effort schatting van de gerealiseerde PnL (netto, na close-fees)
-    sinds `opened_at` voor `symbol`, uit user_fills_by_time. Gedeeld door
-    reconcile_positions() en place_entry_order()'s tegengestelde-positie-
-    guard, zodat een "buiten de bot om gesloten"-detectie altijd dezelfde
-    PnL-melding oplevert, ongeacht welke van de twee 'm als eerste opmerkt.
-    Puur informatief (geen boekhoudkundige garantie), dus faalt stil (None)
-    i.p.v. de aanroeper te laten crashen op een ontbrekende PnL-schatting.
+async def _estimate_realized_pnl_since(symbol: str, opened_at, client=None) -> Optional[float]:
+    """Best-effort schatting van de gerealiseerde PnL sinds `opened_at` voor
+    `symbol`, uit historical_pnl_v3. Puur informatief (geen boekhoudkundige
+    garantie), dus faalt stil (None) i.p.v. de aanroeper te laten crashen.
 
-    feeToken: Hyperliquid-fees zijn meestal in USDC, maar kunnen ook in een
-    ander token betaald zijn (bv. builder-fee-korting) -- 'fee' is dan NIET
-    in USD, dus die fills tellen alleen mee voor de bruto PnL, niet voor de
-    fee-aftrek (voorkomt een fee in de verkeerde eenheid van een USD-bedrag
-    aftrekken)."""
+    LET OP: het exacte veldenschema van historicalPnl-items is NIET
+    rechtstreeks bevestigd (het testaccount had geen trade-historie om tegen
+    te checken) -- vandaar de brede try/except hieronder, die dit bewust naar
+    "onbekend" laat degraderen i.p.v. te crashen als een aanname mis blijkt."""
+    client = client or await _get_client()
     try:
+        apex_symbol = _apex_symbol(symbol)
         opened_at_ms = int(opened_at * 1000)
         if not opened_at_ms:
             return None
-        fills = await _call(info.user_fills_by_time, owner, opened_at_ms, int(time.time() * 1000))
-        closing_fills = [f for f in fills if f.get("coin") == symbol and "Close" in f.get("dir", "")]
-        # closedPnl is bruto (excl. fee); Phantom/Hyperliquid's trade-geschiedenis
-        # trekt per close alleen de fee van díe close eraf (de entry-fee zit al
-        # verwerkt in de cost basis en duikt daar niet los op) -- dus alleen de
-        # close-fees aftrekken geeft het bedrag dat overeenkomt met wat je daar ziet.
-        gross_pnl = sum(float(f["closedPnl"]) for f in closing_fills)
-        fees = sum(
-            float(f.get("fee", 0.0)) for f in closing_fills if f.get("feeToken", "USDC") == "USDC"
-        )
-        return gross_pnl - fees
+        resp = await _call(client.historical_pnl_v3, symbol=apex_symbol, limit=200)
+        data = _check_order_status(resp, "historical PnL opvragen")
+        entries = data.get("historicalPnl") or []
+        relevant = [e for e in entries if int(e.get("createdAt", 0) or 0) >= opened_at_ms]
+        return sum(float(e.get("realizedPnl", 0) or 0) for e in relevant)
     except Exception:
         log.exception("Kon gerealiseerde PnL niet ophalen sinds entry voor %s", symbol)
         return None
 
 
-async def reconcile_positions(exchange=None, info=None):
+async def reconcile_positions(client=None):
     """
     Achtergrondtaak (zie main.py): vergelijkt periodiek de lokale v2-state
-    met de ECHTE open posities op Hyperliquid. Nodig omdat de lokale state
-    tot nu toe ALLEEN werd bijgewerkt via Telegram TP/cancel-events -- een
-    resting SL-order die rechtstreeks op de exchange getriggerd wordt (dus
-    buiten de bot om) laat geen Telegram-bericht achter, en een TP/cancel-
-    event dat ambigu is (meerdere v2-posities voor dezelfde coin, zie
-    handle_tp_event()/handle_cancel_event()) werd tot nu toe genegeerd zonder
-    dat de state ooit alsnog werd opgeschoond.
-
-    Incident 2026-08-26/28: drie PENGU-posities sloten ná elkaar via hun
-    resting SL zonder dat de bot het ooit doorhad -- open_positions.json
-    bleef tot de gebruiker het zelf in Phantom checkte "open" tonen terwijl
-    er op Hyperliquid allang niks meer stond, en de gebruiker kreeg daar
-    nooit een Telegram-melding van.
-
-    Voor elke lokale v2-entry: bestaat er nog een ECHTE open positie op
-    Hyperliquid voor deze coin+richting (assetPositions, szi-teken bepaalt
-    long/short)? Zo niet, dan is de positie buiten de bot om gesloten (SL
-    geraakt, handmatig, of anders) -- state opschonen en de gebruiker een
-    Telegram-melding sturen met een schatting van de gerealiseerde PnL sinds
-    opened_at (uit user_fills_by_time). De PnL-schatting is best-effort/
-    informatief (geen boekhoudkundige garantie als er tussentijds nog een
-    andere positie voor dezelfde coin+richting is geweest) -- het doel is dat
-    een stille close nooit meer onopgemerkt blijft, niet een exacte P&L-audit.
-    """
+    met de ECHTE open posities op ApeX Omni -- ONGEWIJZIGDE logica t.o.v. de
+    Hyperliquid-versie (zie config.POSITION_RECONCILE_INTERVAL_SECONDS voor
+    de incident-geschiedenis)."""
     async with _state_lock:
         state = _load_state()
     v2_keys = [k for k, pos in state.items() if pos.get("version") == "v2"]
     if not v2_keys:
         return
 
-    info = info or _get_info()
-    owner = get_owner_address()
-    perp_state = await _call(info.user_state, owner)
-    live_positions = _parse_live_positions(perp_state)
+    client = client or await _get_client()
+    live_positions = await _fetch_live_positions(client)
 
     for key in v2_keys:
         async with _state_lock:
@@ -1370,9 +1237,9 @@ async def reconcile_positions(exchange=None, info=None):
         is_buy = pos["is_buy"]
         live = live_positions.get(symbol)
         if live is not None and live["is_buy"] == is_buy:
-            continue  # nog echt open op Hyperliquid, niks te doen
+            continue  # nog echt open op ApeX Omni, niks te doen
 
-        realized_pnl = await _estimate_realized_pnl_since(symbol, pos.get("opened_at", 0), owner, info)
+        realized_pnl = await _estimate_realized_pnl_since(symbol, pos.get("opened_at", 0), client)
 
         async with _state_lock:
             state = _load_state()
@@ -1381,17 +1248,17 @@ async def reconcile_positions(exchange=None, info=None):
 
         pnl_txt = f"~${realized_pnl:.2f}" if realized_pnl is not None else "onbekend"
         log.warning(
-            "Reconciliatie: %s stond niet meer open op Hyperliquid maar wel nog in lokale state "
+            "Reconciliatie: %s stond niet meer open op ApeX Omni maar wel nog in lokale state "
             "-- waarschijnlijk buiten de bot om gesloten (bv. resting SL). State opgeschoond, "
             "gerealiseerde PnL sinds entry: %s.",
             key, pnl_txt,
         )
         db.log_tp_event(
             symbol=symbol, event="position_closed_externally_detected",
-            detail=f"key={key}, niet meer open op Hyperliquid, state opgeschoond, PnL sinds entry: {pnl_txt}",
+            detail=f"key={key}, niet meer open op ApeX Omni, state opgeschoond, PnL sinds entry: {pnl_txt}",
         )
         await _notify(
-            f"⚠️ {symbol} ({'Buy' if is_buy else 'Sell'}) bleek al gesloten op Hyperliquid "
+            f"⚠️ {symbol} ({'Buy' if is_buy else 'Sell'}) bleek al gesloten op ApeX Omni "
             f"(waarschijnlijk SL geraakt) zonder dat de bot dit doorhad -- pas nu bij reconciliatie "
             f"ontdekt. Gerealiseerde PnL sinds entry: {pnl_txt}. Lokale state opgeschoond."
         )

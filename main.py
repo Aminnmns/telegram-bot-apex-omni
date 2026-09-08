@@ -159,7 +159,7 @@ async def send_heartbeat():
 async def reconcile_missed_messages():
     """Zie comment bij RECONCILE_INTERVAL_SECONDS hierboven. Draait los van de
     live listener: mist deze taak zelf een cyclus door een trage/hangende
-    Hyperliquid-call, dan pakt de volgende cyclus (60s later) het gewoon
+    ApeX Omni-call, dan pakt de volgende cyclus (60s later) het gewoon
     weer op -- de lookback-window is ruim genoeg (10 min) om dat te overleven."""
     await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
     while True:
@@ -203,7 +203,7 @@ async def reconcile_positions_loop():
 
 def main():
     db.init_db()
-    log.info("Bot start | HYPERLIQUID_ENV=%s | DRY_RUN=%s", config.HYPERLIQUID_ENV, config.DRY_RUN)
+    log.info("Bot start | APEX_ENV=%s | DRY_RUN=%s", config.APEX_ENV, config.DRY_RUN)
     with client:
         client.loop.create_task(send_heartbeat())
         client.loop.create_task(reconcile_missed_messages())
