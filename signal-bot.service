@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram Crypto Signal Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-signal-bot
+ExecStart=/root/telegram-signal-bot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

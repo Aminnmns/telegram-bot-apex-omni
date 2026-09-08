@@ -1,0 +1,146 @@
+"""
+Centrale configuratie. Alles wordt geladen uit een .env bestand
+(zie .env.example) zodat je nooit keys in de code zelf zet.
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val else default
+
+
+def _int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val else default
+
+
+# --- Telegram ---
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "signal_bot_session")
+TELEGRAM_GROUP = os.getenv("TELEGRAM_GROUP", "")  # groep username, invite-link of chat-ID
+TELEGRAM_NOTIFY_CHAT = os.getenv("TELEGRAM_NOTIFY_CHAT", "")  # waar de bot JOU updates stuurt (bv. "me")
+
+# --- Hyperliquid (vervangt Flash Trade als trading-venue, augustus 2026) ---
+# Flash Trade gaf herhaaldelijk on-chain problemen tijdens setup en heeft geen
+# Python-SDK (alles was zelf-gebouwde/gesignde ruwe Solana-tx's). Hyperliquid
+# heeft een officieel onderhouden Python-SDK (hyperliquid-dex/hyperliquid-python-sdk)
+# met directe order()/update_leverage()-calls en ingebouwde TP/SL-trigger-orders.
+#
+# BELANGRIJK: Hyperliquid draait NIET op Solana -- het gebruikt Ethereum-stijl
+# (secp256k1) wallets. Dit is dezelfde EVM-account als Phantom's ingebouwde
+# "Perps"-feature gebruikt (zelfde seed phrase als de Solana-wallet, maar een
+# apart 0x-adres) -- zelf geverifieerd via Phantom's eigen docs: "You can
+# export your perps account by exporting your Phantom wallet's private key
+# and importing it into any EVM-compatible wallet." Exporteer 'm via Phantom:
+# instellingen -> account -> Show Private Key -> netwerk "Ethereum" kiezen
+# (Ethereum/Base/Polygon/HyperEVM delen dezelfde private key per account).
+HYPERLIQUID_PRIVATE_KEY = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+
+# Optioneel: laat leeg tenzij je met een apart API-agent-wallet signt terwijl
+# je toch tegen het hoofdaccount wilt traden (approve_agent-flow). Leeg =
+# het adres dat bij HYPERLIQUID_PRIVATE_KEY hoort.
+HYPERLIQUID_ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS", "")
+
+# "mainnet" of "testnet". Bewust op "mainnet" als default: dit gebruikt het
+# bestaande Phantom Perps-saldo, geen apart testnet-geld.
+HYPERLIQUID_ENV = os.getenv("HYPERLIQUID_ENV", "mainnet")
+
+# --- Safety / mode ---
+# Staat standaard op "veilig". Zet pas uit als je alles hebt getest.
+DRY_RUN = _bool("DRY_RUN", True)  # True = alles loggen, niets echt uitvoeren
+
+# Max. aantal gelijktijdig open live posities, simpele harde grens. Gecheckt
+# via Hyperliquid's eigen clearinghouseState vlak voor elke nieuwe entry (alle
+# live posities, ongeacht via welke flow ze geopend zijn) -- niet een lokale
+# telling die uit sync kan raken met wat er écht op de exchange staat.
+MAX_CONCURRENT_POSITIONS = _int("MAX_CONCURRENT_POSITIONS", 8)
+
+# --- Positiegrootte ---
+# Elke trade gebruikt exact dit percentage van je op dat moment BESCHIKBARE
+# saldo (get_withdrawable(): perps-withdrawable + vrije spot-USDC) als margin
+# -- qty = (saldo * MAX_MARGIN_PCT_OF_FUNDS/100 * toegestane leverage) / prijs,
+# naar beneden afgerond zodat de marge nooit boven de cap uitkomt (zie
+# executor._calc_margin_based_qty). Isolated margin, dus dit is meteen ook je
+# worst-case-verlies per trade (niet meer dan je marge).
+#
+# VERVANGT de oude MAX_RISK_USD-aanpak (vast dollarbedrag, qty = MAX_RISK_USD
+# / |entry - SL|): die was volledig onafhankelijk van leverage, waardoor een
+# lagere dan verwachte max-leverage per coin (bv. HYPE: signal vroeg 25x,
+# Hyperliquid staat maar 10x toe) evenveel qty maar 2.5x zoveel margin kostte
+# -- bij een klein account (~$20) at dat in de praktijk 70-80% van het totale
+# saldo op (incident 2026-08-11/12). Direct als %-van-saldo sizen voorkomt dat
+# soort verrassingen structureel, ongeacht welke leverage een coin toestaat.
+MAX_MARGIN_PCT_OF_FUNDS = _float("MAX_MARGIN_PCT_OF_FUNDS", 33.0)
+
+# Hyperliquid weigert orders onder deze notional-waarde (zelf geverifieerd
+# via hun docs).
+MIN_NOTIONAL_USD = _float("MIN_NOTIONAL_USD", 10.0)
+
+# --- v2 TP-executie (alleen voor NIEUWE signals) ---
+# 5-staps ladder over de ORIGINELE positiegrootte, één stap per "target N
+# ✅"-bericht van de groep: target 1 sluit TARGET1_CLOSE_PCT%, target 2 sluit
+# TARGET2_CLOSE_PCT% erbovenop, enz. Target 5 heeft bewust GEEN eigen
+# %-config -- die sluit altijd de volledige resterende qty (finale exit,
+# vangt ook cumulatieve afrondingsverschillen en MIN_NOTIONAL_USD-fallbacks
+# van eerdere targets op, zie executor._handle_tpN_event's docstrings).
+# SL-naar-break-even gebeurt bij target BREAKEVEN_MOVE_AFTER_TARGET (zie
+# executor._handle_tp_partial_event), los van de close-percentages hierboven.
+TP_EVENT_TARGET1_CLOSE_PCT = _float("TP_EVENT_TARGET1_CLOSE_PCT", 40.0)
+TP_EVENT_TARGET2_CLOSE_PCT = _float("TP_EVENT_TARGET2_CLOSE_PCT", 20.0)
+TP_EVENT_TARGET3_CLOSE_PCT = _float("TP_EVENT_TARGET3_CLOSE_PCT", 15.0)
+TP_EVENT_TARGET4_CLOSE_PCT = _float("TP_EVENT_TARGET4_CLOSE_PCT", 15.0)
+
+# Bij welke target de SL naar break-even verplaatst wordt (1 t/m 4). Later dan
+# target 1 geeft de trade meer ademruimte vóórdat de tight break-even-stop
+# actief wordt -- voorkomt dat een normale terugval na een vroege, kleine
+# TP1 de hele rest van de positie er meteen uitgooit voordat verdere targets
+# (2 t/m 5) ooit geraakt worden (incident 2026-08-25: PENGU/BTC/HYPE).
+BREAKEVEN_MOVE_AFTER_TARGET = _int("BREAKEVEN_MOVE_AFTER_TARGET", 2)
+
+# De break-even-SL bij BREAKEVEN_MOVE_AFTER_TARGET wordt NIET meer op een
+# vaste afstand van de entry-prijs gelegd, maar op het prijsniveau waarbij de
+# HELE trade (al gerealiseerde winst uit eerdere targets + PnL op het
+# restant) op $0 uitkomt -- zie executor._handle_tp_partial_event's
+# banked_pnl-berekening. Meer winst uit eerdere targets geeft dus automatisch
+# meer ademruimte voor latere targets (2 t/m 5), zonder dat de trade als
+# geheel ooit netto verlies kan maken (verzoek gebruiker 2026-08-26: TP1+TP2
+# als "verzekering" i.p.v. een gegokt vast percentage).
+# Dit percentage is een veiligheidsmarge (% van de ORIGINELE notional, zie
+# incident 2026-09-01 hierboven) voor fees/slippage, afgetrokken van de
+# gebankte (bruto) winst vóórdat de break-even-prijs berekend wordt. 0,15%
+# dekt ruim het volledige entry+exit fee-rondje (~0,086% gemeten op
+# Hyperliquid) plus wat marge voor slippage op de SL-fill zelf.
+BREAKEVEN_PNL_SAFETY_MARGIN_PCT = _float("BREAKEVEN_PNL_SAFETY_MARGIN_PCT", 0.15)
+
+# Incident 2026-08-26/28: lokale open_positions.json werd ALLEEN bijgewerkt
+# via Telegram TP/cancel-events. Een resting SL die rechtstreeks op
+# Hyperliquid triggert (buiten de bot om) of een ambigu TP/cancel-event
+# (meerdere v2-posities voor dezelfde coin) liet de state dus voor onbepaalde
+# tijd stil verouderen -- de gebruiker ontdekte drie zulke stille closes pas
+# zelf in Phantom, dagen later. executor.reconcile_positions() vergelijkt nu
+# periodiek de lokale state met de ECHTE Hyperliquid-posities en ruimt/meldt
+# elke mismatch op. Interval is een compromis tussen snel ontdekken en niet
+# onnodig vaak Hyperliquid's /info bevragen.
+POSITION_RECONCILE_INTERVAL_SECONDS = _int("POSITION_RECONCILE_INTERVAL_SECONDS", 120)
+
+# Incident 2026-09-08: de Hyperliquid-SDK gebruikt standaard GEEN timeout op
+# zijn requests-sessie (timeout=None) -- een hangende TCP-verbinding naar
+# Hyperliquid liet reconcile_positions_loop() dagenlang stilzwijgend
+# vastlopen (geen enkele log-regel meer, ook geen foutmelding), waardoor
+# state-drift niet meer werd opgevangen. Elke Info/Exchange-call krijgt nu
+# een harde timeout zodat een hangende call altijd een Exception oplevert
+# die de bestaande try/except-loops kunnen afvangen en waarna de loop gewoon
+# doorgaat.
+HYPERLIQUID_API_TIMEOUT_SECONDS = _float("HYPERLIQUID_API_TIMEOUT_SECONDS", 15.0)

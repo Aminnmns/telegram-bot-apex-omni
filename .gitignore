@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.session
+*.session-journal
+bot_history.db
+open_positions.json

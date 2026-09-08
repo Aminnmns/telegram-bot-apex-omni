@@ -1,0 +1,14 @@
+[Unit]
+Description=Signal Bot Dashboard (read-only, localhost-only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-signal-bot
+ExecStart=/root/telegram-signal-bot/venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
